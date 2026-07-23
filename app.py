@@ -1,33 +1,43 @@
 from flask import Flask, render_template_string, request, redirect, url_for
 import os
+import json
+from datetime import datetime
 
 app = Flask(__name__)
 
-# Geçici hafıza (İstediğiniz zaman ekleyip güncelleyebileceğiniz liste)
-market_opportunities = [
-    {
-        "id": 1,
-        "name": "Pepe (PEPE)",
-        "price": "$0.0000142",
-        "change": "+14.85%",
-        "change_val": 14.85,
-        "volume": "$1,450,200,000",
-        "reason": "Ani hacim patlaması ve güçlü yukarı kırılım.",
-        "signal": "VOLATİL ATAK (AL)",
-        "badge": "buy"
-    },
-    {
-        "id": 2,
-        "name": "Render (RENDER)",
-        "price": "$7.45",
-        "change": "+8.20%",
-        "change_val": 8.20,
-        "volume": "$620,100,000",
-        "reason": "Yüksek alım iştahı ve direnç seviyesi testi.",
-        "signal": "GÜÇLÜ MOMENTUM",
-        "badge": "buy"
-    }
-]
+# Veri dosyası
+DATA_FILE = "market_opportunities.json"
+
+def load_opportunities():
+    """JSON dosyasından verileri yükle"""
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def save_opportunities(data):
+    """Verileri JSON dosyasına kaydet"""
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def validate_input(name, price, change, volume, reason, signal):
+    """Input validasyonu"""
+    errors = []
+    
+    if not name or len(name) < 2 or len(name) > 50:
+        errors.append("Varlık adı 2-50 karakter olmalı")
+    if not price or not any(c.isdigit() for c in price):
+        errors.append("Geçerli fiyat girin")
+    if not change or "%" not in change:
+        errors.append("Değişim % ile bitmelidir")
+    if not volume or len(volume) < 2:
+        errors.append("Hacim girin")
+    if not reason or len(reason) < 5:
+        errors.append("Gerekçe en az 5 karakter olmalı")
+    if signal not in ["VOLATİL ATAK (AL)", "GÜÇLÜ MOMENTUM", "DİP FIRSATI", "İZLE & TOPLA"]:
+        errors.append("Geçerli sinyal seçin")
+    
+    return errors
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -48,116 +58,400 @@ HTML_TEMPLATE = """
             --hold-color: #f59e0b;
             --border-color: #334155;
         }
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; background-color: var(--bg-color); color: var(--text-color); margin: 0; padding: 20px; }
-        header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 15px; margin-bottom: 25px; }
-        h1 { margin: 0; color: var(--accent-blue); font-size: 22px; }
-        .card { background-color: var(--card-bg); border-radius: 12px; padding: 20px; border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0,0,0,0.3); margin-bottom: 25px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 14px; text-align: left; border-bottom: 1px solid var(--border-color); }
-        th { background-color: #111827; color: var(--text-muted); font-size: 12px; text-transform: uppercase; }
+        * { box-sizing: border-box; }
+        body { 
+            font-family: 'Segoe UI', Tahoma, sans-serif; 
+            background-color: var(--bg-color); 
+            color: var(--text-color); 
+            margin: 0; 
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        header { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            border-bottom: 2px solid var(--accent-blue); 
+            padding-bottom: 20px; 
+            margin-bottom: 30px;
+        }
+        h1 { margin: 0; color: var(--accent-blue); font-size: 24px; }
+        .status { color: var(--buy-color); font-weight: bold; font-size: 12px; }
+        .card { 
+            background-color: var(--card-bg); 
+            border-radius: 12px; 
+            padding: 24px; 
+            border: 1px solid var(--border-color); 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3); 
+            margin-bottom: 25px; 
+        }
+        .card h3 { margin-top: 0; color: var(--text-muted); font-size: 16px; }
+        
+        /* Form */
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 5px; text-transform: uppercase; }
+        input, select, textarea { 
+            padding: 10px 12px; 
+            margin-right: 10px; 
+            margin-bottom: 10px; 
+            border-radius: 6px; 
+            border: 1px solid var(--border-color); 
+            background: #0f172a; 
+            color: var(--text-color);
+            width: calc(100% - 100px);
+        }
+        input:focus, select:focus, textarea:focus { 
+            outline: none; 
+            border-color: var(--accent-blue);
+            box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+        }
+        textarea { width: 100%; min-height: 60px; resize: vertical; }
+        .form-row { display: flex; flex-wrap: wrap; gap: 10px; }
+        
+        /* Error/Success */
+        .error-msg { 
+            background: rgba(239,68,68,0.1); 
+            border: 1px solid var(--sell-color); 
+            color: var(--sell-color);
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            font-size: 13px;
+        }
+        .error-msg ul { margin: 5px 0 0 0; padding-left: 20px; }
+        
+        .success-msg { 
+            background: rgba(34,197,94,0.1); 
+            border: 1px solid var(--buy-color); 
+            color: var(--buy-color);
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+        }
+        
+        /* Search */
+        .search-box { 
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .search-box input { width: 300px; }
+        .search-box select { width: auto; padding: 10px 12px; }
+        
+        /* Buttons */
+        button { 
+            background: var(--accent-blue); 
+            color: #0f172a; 
+            font-weight: bold; 
+            cursor: pointer; 
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            transition: opacity 0.2s;
+        }
+        button:hover { opacity: 0.9; }
+        
+        .btn-delete { 
+            background: var(--sell-color); 
+            color: white; 
+            padding: 6px 12px; 
+            border-radius: 4px; 
+            text-decoration: none; 
+            font-size: 11px; 
+            font-weight: bold;
+            border: none;
+            cursor: pointer;
+        }
+        .btn-delete:hover { opacity: 0.8; }
+        
+        /* Table */
+        table { 
+            width: 100%; 
+            border-collapse: collapse; 
+            margin-top: 15px;
+        }
+        th, td { 
+            padding: 14px; 
+            text-align: left; 
+            border-bottom: 1px solid var(--border-color); 
+            font-size: 14px;
+        }
+        th { 
+            background-color: #111827; 
+            color: var(--text-muted); 
+            font-size: 11px; 
+            text-transform: uppercase;
+            font-weight: 600;
+        }
         tr:hover { background-color: rgba(56, 189, 248, 0.05); }
-        .badge { padding: 6px 12px; border-radius: 6px; font-weight: bold; font-size: 11px; display: inline-block; text-align: center; }
-        .badge-buy { background: rgba(34,197,94,0.2); color: var(--buy-color); border: 1px solid var(--buy-color); }
-        .badge-sell { background: rgba(239,68,68,0.2); color: var(--sell-color); border: 1px solid var(--sell-color); }
-        .badge-hold { background: rgba(245,158,11,0.2); color: var(--hold-color); border: 1px solid var(--hold-color); }
-        form input, form select, form button { padding: 10px; margin-right: 10px; margin-bottom: 10px; border-radius: 6px; border: 1px solid var(--border-color); background: #0f172a; color: var(--text-color); }
-        form button { background: var(--accent-blue); color: #0f172a; font-weight: bold; cursor: pointer; border: none; }
-        form button:hover { opacity: 0.9; }
-        .btn-delete { background: var(--sell-color); color: white; padding: 5px 10px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; }
+        
+        /* Badge */
+        .badge { 
+            padding: 6px 12px; 
+            border-radius: 6px; 
+            font-weight: bold; 
+            font-size: 11px; 
+            display: inline-block;
+        }
+        .badge-buy { 
+            background: rgba(34,197,94,0.2); 
+            color: var(--buy-color); 
+            border: 1px solid var(--buy-color); 
+        }
+        
+        /* Change Color */
+        .change-positive { color: var(--buy-color); font-weight: 600; }
+        .change-negative { color: var(--sell-color); font-weight: 600; }
+        
+        .empty-state { 
+            text-align: center; 
+            padding: 40px; 
+            color: var(--text-muted);
+        }
+        
+        @media (max-width: 768px) {
+            input, select, textarea { width: 100%; }
+            header { flex-direction: column; gap: 15px; }
+            table { font-size: 12px; }
+            th, td { padding: 10px 8px; }
+        }
     </style>
 </head>
 <body>
-    <header>
-        <h1>🚀 Kısa Vade Hacim Patlaması & Yönetim Paneli</h1>
-        <span style="color: #22c55e; font-weight: bold; font-size: 13px;">● Dinamik Kontrol Aktif</span>
-    </header>
+    <div class="container">
+        <header>
+            <h1>🚀 Kısa Vade Hacim Patlaması & Yönetim Paneli</h1>
+            <span class="status">● Dinamik Kontrol Aktif</span>
+        </header>
 
-    <!-- Yeni Varlık Ekleme Formu -->
-    <div class="card">
-        <h3 style="margin-top:0; color: var(--text-muted);">➕ Listeye Yeni Fırsat / Coin Ekle</h3>
-        <form action="/add" method="POST">
-            <input type="text" name="name" placeholder="Coin Adı (Örn: SOL)" required>
-            <input type="text" name="price" placeholder="Fiyat (Örn: $145.00)" required>
-            <input type="text" name="change" placeholder="Değişim (Örn: +12.5%)" required>
-            <input type="text" name="volume" placeholder="Hacim (Örn: $500M)" required>
-            <input type="text" name="reason" placeholder="Gerekçe / Not" style="width: 250px;" required>
-            <select name="signal">
-                <option value="VOLATİL ATAK (AL)">VOLATİL ATAK (AL)</option>
-                <option value="GÜÇLÜ MOMENTUM">GÜÇLÜ MOMENTUM</option>
-                <option value="DİP FIRSATI">DİP FIRSATI</option>
-                <option value="İZLE & TOPLA">İZLE & TOPLA</option>
-            </select>
-            <button type="submit">Listeye Ekle</button>
-        </form>
+        {% if error %}
+        <div class="error-msg">
+            <strong>❌ Hata!</strong>
+            <ul>
+            {% for err in error %}
+                <li>{{ err }}</li>
+            {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        {% if success %}
+        <div class="success-msg">✓ {{ success }}</div>
+        {% endif %}
+
+        <!-- Form Kartı -->
+        <div class="card">
+            <h3>➕ Listeye Yeni Fırsat / Coin Ekle</h3>
+            <form action="/add" method="POST">
+                <div class="form-row">
+                    <div style="flex: 1; min-width: 200px;">
+                        <label>Coin Adı *</label>
+                        <input type="text" name="name" placeholder="Örn: SOL, PEPE" required maxlength="50">
+                    </div>
+                    <div style="flex: 1; min-width: 200px;">
+                        <label>Fiyat *</label>
+                        <input type="text" name="price" placeholder="Örn: $145.00" required maxlength="20">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div style="flex: 1; min-width: 200px;">
+                        <label>24s Değişim *</label>
+                        <input type="text" name="change" placeholder="Örn: +12.5%" required maxlength="20">
+                    </div>
+                    <div style="flex: 1; min-width: 200px;">
+                        <label>Hacim *</label>
+                        <input type="text" name="volume" placeholder="Örn: $500M" required maxlength="30">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Gerekçe / Not *</label>
+                    <textarea name="reason" placeholder="Neden bu fırsatı takip ediyorsun?" required maxlength="200"></textarea>
+                </div>
+                <div class="form-row">
+                    <div style="flex: 1; min-width: 200px;">
+                        <label>Sinyal Türü *</label>
+                        <select name="signal" required style="width: 100%;">
+                            <option value="">Seç...</option>
+                            <option value="VOLATİL ATAK (AL)">🔥 VOLATİL ATAK (AL)</option>
+                            <option value="GÜÇLÜ MOMENTUM">📈 GÜÇLÜ MOMENTUM</option>
+                            <option value="DİP FIRSATI">🎯 DİP FIRSATI</option>
+                            <option value="İZLE & TOPLA">👁️ İZLE & TOPLA</option>
+                        </select>
+                    </div>
+                </div>
+                <button type="submit">✓ Listeye Ekle</button>
+            </form>
+        </div>
+
+        <!-- Liste Kartı -->
+        <div class="card">
+            <h3>Anlık Takip Edilen Fırsatlar ({{ total }})</h3>
+            
+            {% if opportunities %}
+            <div class="search-box">
+                <input type="text" id="searchInput" placeholder="🔍 Coin adı, sinyal veya gerekçe ara...">
+                <select id="sortSelect">
+                    <option value="latest">En Yeni</option>
+                    <option value="change-high">Değişim ↓ (Yüksek)</option>
+                    <option value="change-low">Değişim ↑ (Düşük)</option>
+                </select>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Varlık</th>
+                        <th>Fiyat</th>
+                        <th>24s Değişim</th>
+                        <th>Hacim</th>
+                        <th>Gerekçe</th>
+                        <th>Sinyal</th>
+                        <th>Aksiyon</th>
+                    </tr>
+                </thead>
+                <tbody id="tableBody">
+                    {% for item in opportunities %}
+                    <tr class="data-row" data-name="{{ item.name }}" data-signal="{{ item.signal }}" data-change="{{ item.change_val }}">
+                        <td><strong>{{ item.name }}</strong></td>
+                        <td>{{ item.price }}</td>
+                        <td>
+                            {% if item.change_val >= 0 %}
+                            <span class="change-positive">{{ item.change }}</span>
+                            {% else %}
+                            <span class="change-negative">{{ item.change }}</span>
+                            {% endif %}
+                        </td>
+                        <td style="color: var(--text-muted); font-size: 13px;">{{ item.volume }}</td>
+                        <td>{{ item.reason }}</td>
+                        <td><span class="badge badge-buy">{{ item.signal }}</span></td>
+                        <td><a href="/delete/{{ item.id }}" class="btn-delete" onclick="return confirm('Silmek istediğine emin misin?')">🗑️ Sil</a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty-state">
+                <p>📭 Henüz veri yok. İlk fırsatını ekleye başla!</p>
+            </div>
+            {% endif %}
+        </div>
     </div>
 
-    <!-- Mevcut Liste Tablosu -->
-    <div class="card">
-        <h3 style="margin-top:0; color: var(--text-muted);">Anlık Takip Edilen Fırsatlar</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>Varlık</th>
-                    <th>Fiyat</th>
-                    <th>24s Değişim</th>
-                    <th>Toplam Hacim</th>
-                    <th>Algoritma Gerekçesi</th>
-                    <th>Sinyal</th>
-                    <th>Aksiyon</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for item in opportunities %}
-                <tr>
-                    <td><strong>{{ item.name }}</strong></td>
-                    <td>{{ item.price }}</td>
-                    <td style="color: #22c55e">{{ item.change }}</td>
-                    <td style="color: var(--text-muted); font-size: 13px;">{{ item.volume }}</td>
-                    <td>{{ item.reason }}</td>
-                    <td><span class="badge badge-buy">{{ item.signal }}</span></td>
-                    <td><a href="/delete/{{ item.id }}" class="btn-delete">Kaldır</a></td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
+    <script>
+        document.getElementById('searchInput')?.addEventListener('input', (e) => {
+            const query = e.target.value.toLowerCase();
+            document.querySelectorAll('.data-row').forEach(row => {
+                const text = row.textContent.toLowerCase();
+                row.style.display = text.includes(query) ? '' : 'none';
+            });
+        });
+
+        document.getElementById('sortSelect')?.addEventListener('change', (e) => {
+            const tbody = document.getElementById('tableBody');
+            const rows = Array.from(tbody.querySelectorAll('.data-row'));
+            
+            if (e.target.value === 'latest') {
+                rows.reverse();
+            } else if (e.target.value === 'change-high') {
+                rows.sort((a, b) => 
+                    parseFloat(b.getAttribute('data-change')) - parseFloat(a.getAttribute('data-change'))
+                );
+            } else if (e.target.value === 'change-low') {
+                rows.sort((a, b) => 
+                    parseFloat(a.getAttribute('data-change')) - parseFloat(b.getAttribute('data-change'))
+                );
+            }
+            
+            rows.forEach(row => tbody.appendChild(row));
+        });
+    </script>
 </body>
 </html>
 """
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE, opportunities=market_opportunities)
+    opportunities = load_opportunities()
+    return render_template_string(
+        HTML_TEMPLATE, 
+        opportunities=opportunities,
+        total=len(opportunities),
+        error=None,
+        success=None
+    )
 
 @app.route("/add", methods=["POST"])
 def add_opportunity():
-    new_id = len(market_opportunities) + 1
-    name = request.form.get("name")
-    price = request.form.get("price")
-    change = request.form.get("change")
-    volume = request.form.get("volume")
-    reason = request.form.get("reason")
-    signal = request.form.get("signal")
+    name = request.form.get("name", "").strip()
+    price = request.form.get("price", "").strip()
+    change = request.form.get("change", "").strip()
+    volume = request.form.get("volume", "").strip()
+    reason = request.form.get("reason", "").strip()
+    signal = request.form.get("signal", "").strip()
 
-    market_opportunities.append({
+    # Validasyon
+    errors = validate_input(name, price, change, volume, reason, signal)
+    if errors:
+        opportunities = load_opportunities()
+        return render_template_string(
+            HTML_TEMPLATE,
+            opportunities=opportunities,
+            total=len(opportunities),
+            error=errors,
+            success=None
+        )
+
+    # Değişim değerini parse et
+    try:
+        change_val = float(change.replace("%", "").replace("+", ""))
+    except:
+        change_val = 0.0
+
+    # Yeni varlık
+    opportunities = load_opportunities()
+    new_id = max([item["id"] for item in opportunities], default=0) + 1
+    
+    new_item = {
         "id": new_id,
         "name": name,
         "price": price,
         "change": change,
-        "change_val": 5.0,
+        "change_val": change_val,
         "volume": volume,
         "reason": reason,
         "signal": signal,
-        "badge": "buy"
-    })
-    return redirect(url_for('index'))
+        "badge": "buy",
+        "added_at": datetime.now().isoformat()
+    }
+    
+    opportunities.append(new_item)
+    save_opportunities(opportunities)
+    
+    return render_template_string(
+        HTML_TEMPLATE,
+        opportunities=opportunities,
+        total=len(opportunities),
+        error=None,
+        success=f"✓ {name} başarıyla eklendi!"
+    )
 
 @app.route("/delete/<int:item_id>")
 def delete_opportunity(item_id):
-    global market_opportunities
-    market_opportunities = [item for item in market_opportunities if item["id"] != item_id]
+    opportunities = load_opportunities()
+    deleted_name = None
+    
+    for item in opportunities:
+        if item["id"] == item_id:
+            deleted_name = item["name"]
+            break
+    
+    opportunities = [item for item in opportunities if item["id"] != item_id]
+    save_opportunities(opportunities)
+    
     return redirect(url_for('index'))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=True)
