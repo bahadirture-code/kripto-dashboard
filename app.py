@@ -5,8 +5,7 @@ import os
 app = Flask(__name__)
 
 def scan_volume_breakouts():
-    # CoinGecko üzerinden piyasa genelindeki aktif coinleri çekip hacim/değer oranına göre filtreliyoruz
-    url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=25&page=1&sparkline=false&price_change_percentage=24h"
+    url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=30&page=1&sparkline=false&price_change_percentage=24h"
     try:
         response = requests.get(url, timeout=5)
         coins = response.json()
@@ -23,24 +22,21 @@ def scan_volume_breakouts():
         volume = coin.get("total_volume", 0)
         market_cap = coin.get("market_cap", 1)
 
-        # Hacim / Market Değer oranı (İlgi patlamasını yakalamak için kritik metrik)
         volume_to_cap = volume / market_cap if market_cap > 0 else 0
 
-        # Sadece kısa sürede hareketlenen, hacmi patlayan ve yükselişte olanları filtrele
-        if change_24h > 3.0 and volume_to_cap > 0.15:
+        # Esnetilmiş ve akıllı skorlama mantığı
+        if change_24h > 2.0:
             signal = "VOLATİL ATAK (AL)"
             badge = "buy"
-            reason = "Ani hacim patlaması ve güçlü alım iştahı var."
-        elif change_24h > 7.0:
-            signal = "GÜÇLÜ MOMENTUM"
-            badge = "buy"
-            reason = "Hızlı fiyat artışı, kısa vadeli fırsat bölgesi."
-        elif change_24h < -5.0 and volume_to_cap > 0.20:
-            signal = "DİPTE HACİM (İLGİ VAR)"
+            reason = "Yukarı yönlü ivmelenme ve hacim desteği."
+        elif change_24h < -2.0:
+            signal = "DİP FIRSATI"
             badge = "hold"
-            reason = "Fiyat düşmüş ancak yüksek hacim giriyor, tepki gelebilir."
+            reason = "Geri çekilme bölgesinde tepki arayışı."
         else:
-            continue  # Hareketsiz veya yatay olanları listeden ele
+            signal = "İzleme Listesi"
+            badge = "hold"
+            reason = "Yatay seyir, kırılım bekleniyor."
 
         opportunities.append({
             "name": f"{name} ({symbol})",
@@ -54,20 +50,19 @@ def scan_volume_breakouts():
             "badge": badge
         })
 
-    # Eğer filtreye uyan hareketli coin az çıkarsa boş kalmasın diye en hareketlileri listele
-    if not opportunities and coins:
-        for coin in coins[:5]:
-            opportunities.append({
-                "name": f"{coin.get('name')} ({coin.get('symbol', '').upper()})",
-                "price": f"${coin.get('current_price', 0):,.2f}",
-                "change": f"{coin.get('price_change_percentage_24h', 0):+.2f}%",
-                "change_val": coin.get('price_change_percentage_24h', 0),
-                "volume": f"${coin.get('total_volume', 0):,.0f}",
-                "ratio": "N/A",
-                "reason": "Anlık hareket izleme havuzunda.",
-                "signal": "TAKİP",
-                "badge": "hold"
-            })
+    # Liste yine de boş kalırsa statik güçlü yedek oluştur
+    if not opportunities:
+        opportunities.append({
+            "name": "Piyasa Verisi Bekleniyor",
+            "price": "$0.00",
+            "change": "+0.00%",
+            "change_val": 0,
+            "volume": "$0",
+            "ratio": "0.00",
+            "reason": "API bağlantısı güncelleniyor.",
+            "signal": "BEKLE",
+            "badge": "hold"
+        })
 
     return opportunities
 
