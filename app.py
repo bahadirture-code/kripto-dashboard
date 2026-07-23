@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, render_template_string
 import requests
+import os
 
 app = Flask(__name__)
 
@@ -129,8 +130,6 @@ HTML_TEMPLATE = """
 def index():
     cryptos = get_crypto_signals()
     return render_template_string(HTML_TEMPLATE, cryptos=cryptos)
-
-import os
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
