@@ -3,199 +3,298 @@ import requests
 import threading
 import time
 from datetime import datetime, timedelta
+import sqlite3
 import json
+import os
 
 app = Flask(__name__)
 
+# Database setup
+DB_FILE = "crypto_recommendations.db"
+
+def init_db():
+    """Database'i başlat"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS recommendations (
+        id INTEGER PRIMARY KEY,
+        coin_id TEXT,
+        symbol TEXT,
+        price REAL,
+        signal TEXT,
+        score INTEGER,
+        confidence INTEGER,
+        timestamp DATETIME,
+        change_24h REAL,
+        change_7d REAL
+    )''')
+    conn.commit()
+    conn.close()
+
+def save_recommendation(coin_id, symbol, price, signal, score, confidence, change_24h, change_7d):
+    """Öneriye DB'ye kaydet"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''INSERT INTO recommendations 
+                 (coin_id, symbol, price, signal, score, confidence, timestamp, change_24h, change_7d)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (coin_id, symbol, price, signal, score, confidence, datetime.now(), change_24h, change_7d))
+    conn.commit()
+    conn.close()
+
+def get_recent_recommendations(limit=50):
+    """Son önerileri getir"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM recommendations ORDER BY timestamp DESC LIMIT ?', (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_coin_history(symbol, limit=10):
+    """Coin'in geçmiş önerileri"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT signal, score, timestamp FROM recommendations WHERE symbol = ? ORDER BY timestamp DESC LIMIT ?', 
+              (symbol, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 # Global veri
-scanner_data = {
-    "opportunities": [],
+bot_data = {
     "last_update": None,
-    "status": "Scanning...",
-    "total_scanned": 0
+    "status": "Initializing...",
+    "recommendations": [],
+    "total_analyzed": 0,
+    "buy_count": 0,
+    "sell_count": 0,
+    "hold_count": 0
 }
 
-# Binance API endpoints
 BINANCE_API = "https://api.binance.com/api/v3"
+COINGECKO_API = "https://api.coingecko.com/api/v3"
 
-def get_top_symbols():
-    """Top 200 USDT coinleri al"""
+def get_top_coins():
+    """Top 50 coini al"""
     try:
-        url = f"{BINANCE_API}/ticker/24hr"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        
-        # USDT'de en yüksek volume'leri filtrele
-        symbols = []
-        for coin in data:
-            if coin['symbol'].endswith('USDT'):
-                try:
-                    volume = float(coin['quoteAssetVolume'])
-                    if volume > 10000000:  # $10M+ hacim
-                        symbols.append(coin['symbol'])
-                except:
-                    pass
-        
-        return sorted(symbols)[:200]  # Top 200
+        url = f"{COINGECKO_API}/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 50,
+            "price_change_percentage": "1h,24h,7d"
+        }
+        response = requests.get(url, params=params, timeout=10)
+        return response.json()
     except Exception as e:
-        print(f"Error getting symbols: {e}")
+        print(f"Error getting coins: {e}")
         return []
 
-def get_kline_data(symbol, interval="1h"):
-    """Mum verisini al (1h ve 4h)"""
+def analyze_and_recommend(coin):
+    """Coin'i analiz et ve tavsiye ver"""
     try:
-        url = f"{BINANCE_API}/klines"
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": 50
-        }
-        response = requests.get(url, params=params, timeout=5)
-        return response.json()
-    except:
-        return None
-
-def calculate_volume_spike(symbol):
-    """Volume spike hesapla"""
-    try:
-        # 1h ve 4h veri al
-        klines_1h = get_kline_data(symbol, "1h")
-        klines_4h = get_kline_data(symbol, "4h")
+        score = 50
+        confidence = 0
         
-        if not klines_1h or len(klines_1h) < 2:
-            return None
+        change_24h = coin.get("price_change_percentage_24h", 0) or 0
+        change_7d = coin.get("price_change_percentage_7d", 0) or 0
+        market_cap = coin.get("market_cap", 0) or 0
+        ath = coin.get("ath", coin.get("current_price", 1)) or 1
+        current_price = coin.get("current_price", 1) or 1
         
-        # Son 1h volume
-        current_volume = float(klines_1h[-1][7])  # quote asset volume
+        # Market cap faktörü
+        if market_cap and market_cap > 1000000000:
+            confidence += 20
         
-        # Ortalama volume (son 20 saat)
-        avg_volume = sum([float(k[7]) for k in klines_1h[:-1]]) / len(klines_1h[:-1]) if len(klines_1h) > 1 else current_volume
+        # 24h momentum - GÜÇLÜ SINYAL
+        if change_24h > 8:
+            score += 25
+            confidence += 20
+        elif change_24h > 4:
+            score += 15
+            confidence += 10
+        elif change_24h > 2:
+            score += 8
+            confidence += 5
+        elif change_24h < -8:
+            score -= 25
+            confidence += 20
+        elif change_24h < -4:
+            score -= 15
+            confidence += 10
+        elif change_24h < -2:
+            score -= 8
+            confidence += 5
         
-        if avg_volume == 0:
-            return None
+        # 7d trend - ÖNEMLİ SINYAL
+        if change_7d > 15:
+            score += 20
+            confidence += 15
+        elif change_7d > 8:
+            score += 12
+            confidence += 10
+        elif change_7d < -15:
+            score -= 20
+            confidence += 15
+        elif change_7d < -8:
+            score -= 12
+            confidence += 10
         
-        # Volume spike yüzdesi
-        spike_percentage = ((current_volume - avg_volume) / avg_volume) * 100
+        # ATH mesafesi - UZUN DÖNEM
+        if ath > 0 and current_price > 0:
+            distance_from_ath = ((ath - current_price) / ath) * 100
+            
+            # Dip fırsatı (50%+ aşağıda)
+            if distance_from_ath > 50:
+                score += 15
+                confidence += 10
+            # ATH'ye yakın (5% içinde) - Risk
+            elif distance_from_ath < 5:
+                score -= 10
         
-        # Son 1h fiyat değişimi
-        open_price = float(klines_1h[-1][1])
-        close_price = float(klines_1h[-1][4])
-        price_change = ((close_price - open_price) / open_price) * 100
+        # Volatilite (aktif işlem)
+        if change_24h != 0:
+            volatility = abs(change_24h)
+            if volatility > 10:
+                confidence += 10
+            elif volatility > 5:
+                confidence += 5
         
-        # 24h fiyat değişimi
-        if klines_4h and len(klines_4h) > 6:
-            open_24h = float(klines_4h[-6][1])
-            close_24h = float(klines_4h[-1][4])
-            change_24h = ((close_24h - open_24h) / open_24h) * 100
+        score = max(0, min(100, score))
+        confidence = max(0, min(100, confidence))
+        
+        # Tavsiye ver
+        if score >= 70 and confidence >= 50:
+            signal = "🟢 STRONG BUY"
+        elif score >= 60:
+            signal = "🟢 BUY"
+        elif score >= 55:
+            signal = "🟡 BUY (CAUTION)"
+        elif score <= 30 and confidence >= 50:
+            signal = "🔴 STRONG SELL"
+        elif score <= 40:
+            signal = "🔴 SELL"
+        elif score <= 45:
+            signal = "🔴 SELL (CAUTION)"
         else:
-            change_24h = 0
+            signal = "⚪ HOLD"
         
         return {
-            "volume_spike": spike_percentage,
-            "current_volume": current_volume,
-            "avg_volume": avg_volume,
-            "price_change_1h": price_change,
-            "price_change_24h": change_24h,
-            "current_price": close_price
+            "signal": signal,
+            "score": score,
+            "confidence": confidence,
+            "change_24h": change_24h,
+            "change_7d": change_7d
         }
+        
     except Exception as e:
-        print(f"Error calculating spike for {symbol}: {e}")
+        print(f"Analysis error: {e}")
         return None
 
-def analyze_volatility():
-    """Volatility analizi yap"""
-    global scanner_data
+def run_bot():
+    """Bot analiz döngüsü"""
+    global bot_data
     
-    scanner_data["status"] = "Scanning..."
+    init_db()
     
-    try:
-        symbols = get_top_symbols()
-        scanner_data["total_scanned"] = len(symbols)
-        
-        opportunities = []
-        
-        for i, symbol in enumerate(symbols):
-            # Her 100 request'te rate limit'i aşmamak için
-            if i % 20 == 0:
-                time.sleep(0.5)
-            
-            analysis = calculate_volume_spike(symbol)
-            
-            if analysis:
-                # Koşulları kontrol et
-                volume_spike = analysis["volume_spike"]
-                price_change = analysis["price_change_1h"]
-                change_24h = analysis["price_change_24h"]
-                
-                # Volatilite trigger'ları
-                trigger = False
-                signal_type = ""
-                confidence = 0
-                
-                # VOLATİL ATAK - Volume spike + fiyat artış
-                if volume_spike > 50 and price_change > 2:
-                    trigger = True
-                    signal_type = "VOLATİL ATAK (AL)"
-                    confidence = min(100, int((volume_spike / 100) * 50 + abs(price_change) * 5))
-                
-                # DİP FIRSATI - Volume spike + fiyat düşüş
-                elif volume_spike > 40 and price_change < -1.5:
-                    trigger = True
-                    signal_type = "DİP FIRSATI"
-                    confidence = min(100, int((volume_spike / 100) * 50 + abs(price_change) * 5))
-                
-                # GÜÇLÜ MOMENTUM - Yüksek 24h değişim + volume
-                elif change_24h > 5 and volume_spike > 30:
-                    trigger = True
-                    signal_type = "GÜÇLÜ MOMENTUM"
-                    confidence = min(100, int((change_24h / 10) * 50 + (volume_spike / 100) * 30))
-                
-                if trigger:
-                    # Coin base adı (BTCUSDT -> BTC)
-                    coin_name = symbol.replace("USDT", "")
-                    
-                    opportunity = {
-                        "id": len(opportunities) + 1,
-                        "name": coin_name,
-                        "symbol": symbol,
-                        "price": f"${analysis['current_price']:.2f}",
-                        "price_val": analysis['current_price'],
-                        "change_1h": f"{price_change:+.2f}%",
-                        "change_24h": f"{change_24h:+.2f}%",
-                        "volume": f"${analysis['current_volume']/1000000:.2f}M",
-                        "volume_val": analysis['current_volume'],
-                        "volume_spike": f"{volume_spike:+.1f}%",
-                        "signal": signal_type,
-                        "confidence": confidence,
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "reason": f"Volume spike: {volume_spike:.1f}% | 1h: {price_change:+.2f}% | 24h: {change_24h:+.2f}%"
-                    }
-                    opportunities.append(opportunity)
-        
-        # En yüksek confidence'a göre sırala
-        opportunities.sort(key=lambda x: x["confidence"], reverse=True)
-        
-        scanner_data["opportunities"] = opportunities[:50]  # Top 50
-        scanner_data["last_update"] = datetime.now().strftime("%H:%M:%S")
-        scanner_data["status"] = f"✓ Hazır ({len(opportunities)} fırsat bulundu)"
-        
-    except Exception as e:
-        scanner_data["status"] = f"❌ Hata: {str(e)}"
-        print(f"Scanner error: {e}")
-
-def scanner_loop():
-    """Arka planda sürekli tarama yap"""
     while True:
         try:
-            analyze_volatility()
-            time.sleep(30)  # Her 30 saniye
+            bot_data["status"] = "Analyzing..."
+            
+            coins = get_top_coins()
+            if not coins:
+                bot_data["status"] = "Failed to fetch data"
+                time.sleep(30)
+                continue
+            
+            recommendations = []
+            buy_count = 0
+            sell_count = 0
+            hold_count = 0
+            
+            for coin in coins:
+                try:
+                    analysis = analyze_and_recommend(coin)
+                    
+                    if not analysis:
+                        continue
+                    
+                    coin_id = coin.get("id", "")
+                    symbol = coin.get("symbol", "").upper()
+                    price = coin.get("current_price", 0)
+                    
+                    # DB'ye kaydet
+                    save_recommendation(
+                        coin_id,
+                        symbol,
+                        price,
+                        analysis["signal"],
+                        analysis["score"],
+                        analysis["confidence"],
+                        analysis["change_24h"],
+                        analysis["change_7d"]
+                    )
+                    
+                    # Sadece önemli sinyalleri göster (BUY/SELL)
+                    if "BUY" in analysis["signal"]:
+                        buy_count += 1
+                        if analysis["score"] >= 65:  # Strong signals only
+                            recommendations.append({
+                                "symbol": symbol,
+                                "name": coin.get("name", ""),
+                                "price": f"${price:.2f}",
+                                "signal": analysis["signal"],
+                                "score": analysis["score"],
+                                "confidence": analysis["confidence"],
+                                "change_24h": f"{analysis['change_24h']:+.2f}%",
+                                "change_7d": f"{analysis['change_7d']:+.2f}%",
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                    elif "SELL" in analysis["signal"]:
+                        sell_count += 1
+                        if analysis["score"] <= 35:
+                            recommendations.append({
+                                "symbol": symbol,
+                                "name": coin.get("name", ""),
+                                "price": f"${price:.2f}",
+                                "signal": analysis["signal"],
+                                "score": analysis["score"],
+                                "confidence": analysis["confidence"],
+                                "change_24h": f"{analysis['change_24h']:+.2f}%",
+                                "change_7d": f"{analysis['change_7d']:+.2f}%",
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                    else:
+                        hold_count += 1
+                
+                except Exception as e:
+                    print(f"Error analyzing coin: {e}")
+                    continue
+            
+            # Sıralama (score'a göre)
+            recommendations.sort(key=lambda x: x["score"], reverse=True)
+            
+            bot_data["recommendations"] = recommendations[:20]
+            bot_data["last_update"] = datetime.now().strftime("%H:%M:%S")
+            bot_data["total_analyzed"] = len(coins)
+            bot_data["buy_count"] = buy_count
+            bot_data["sell_count"] = sell_count
+            bot_data["hold_count"] = hold_count
+            bot_data["status"] = f"✓ Analyzed {len(coins)} coins | Found {len(recommendations)} signals"
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] BUY: {buy_count}, SELL: {sell_count}, HOLD: {hold_count}")
+            
+            time.sleep(300)  # Her 5 dakika
+            
         except Exception as e:
-            print(f"Loop error: {e}")
-            time.sleep(30)
+            bot_data["status"] = f"❌ Error: {str(e)}"
+            print(f"Bot error: {e}")
+            time.sleep(60)
 
-# Arka plan thread başlat
-scanner_thread = threading.Thread(target=scanner_loop, daemon=True)
-scanner_thread.start()
+# Bot thread başlat
+bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread.start()
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -203,7 +302,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Volatility Scanner - Pump/Dump Tespiti</title>
+    <title>Crypto Analyzer Bot</title>
     <style>
         :root {
             --bg-color: #0f172a;
@@ -213,42 +312,42 @@ HTML_TEMPLATE = """
             --accent-blue: #38bdf8;
             --buy-color: #22c55e;
             --sell-color: #ef4444;
-            --orange: #f59e0b;
+            --hold-color: #f59e0b;
             --border-color: #334155;
         }
         * { box-sizing: border-box; }
-        body { 
-            font-family: 'Segoe UI', Tahoma, sans-serif; 
-            background-color: var(--bg-color); 
-            color: var(--text-color); 
-            margin: 0; 
+        body {
+            font-family: 'Segoe UI', Tahoma, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
             padding: 20px;
         }
-        .container { max-width: 1400px; margin: 0 auto; }
-        header { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            border-bottom: 2px solid var(--accent-blue); 
-            padding-bottom: 20px; 
+        .container { max-width: 1200px; margin: 0 auto; }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid var(--accent-blue);
+            padding-bottom: 20px;
             margin-bottom: 30px;
         }
         h1 { margin: 0; color: var(--accent-blue); font-size: 24px; }
-        .stats { 
-            display: flex; 
-            gap: 30px; 
+        .stats {
+            display: flex;
+            gap: 20px;
             font-size: 13px;
         }
-        .stat { 
-            display: flex; 
+        .stat {
+            display: flex;
             flex-direction: column;
         }
-        .stat-value { 
-            color: var(--accent-blue); 
-            font-weight: bold; 
+        .stat-value {
+            color: var(--accent-blue);
+            font-weight: bold;
             font-size: 18px;
         }
-        .stat-label { 
+        .stat-label {
             color: var(--text-muted);
             margin-top: 3px;
         }
@@ -257,118 +356,98 @@ HTML_TEMPLATE = """
             border-radius: 6px;
             font-weight: bold;
             font-size: 12px;
-            display: inline-block;
             background: rgba(34, 197, 94, 0.2);
             color: var(--buy-color);
             border: 1px solid var(--buy-color);
         }
-        .card { 
-            background-color: var(--card-bg); 
-            border-radius: 12px; 
-            padding: 24px; 
-            border: 1px solid var(--border-color); 
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3); 
-            margin-bottom: 25px; 
+        .card {
+            background-color: var(--card-bg);
+            border-radius: 12px;
+            padding: 24px;
+            border: 1px solid var(--border-color);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            margin-bottom: 25px;
         }
-        .card h3 { margin-top: 0; color: var(--text-muted); font-size: 16px; }
+        .card h3 { margin-top: 0; color: var(--text-muted); }
         
-        .controls {
+        .signal-item {
+            padding: 15px;
+            border-left: 4px solid var(--border-color);
+            margin-bottom: 12px;
+            background: rgba(56, 189, 248, 0.05);
+            border-radius: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .signal-item.buy {
+            border-left-color: var(--buy-color);
+            background: rgba(34, 197, 94, 0.05);
+        }
+        .signal-item.sell {
+            border-left-color: var(--sell-color);
+            background: rgba(239, 68, 68, 0.05);
+        }
+        
+        .signal-left {
             display: flex;
             gap: 15px;
-            margin-bottom: 20px;
             align-items: center;
-            flex-wrap: wrap;
+            flex: 1;
+        }
+        .signal-info h4 {
+            margin: 0 0 5px 0;
+            font-size: 16px;
+        }
+        .signal-info p {
+            margin: 0;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        .signal-badge {
+            font-weight: 600;
+            font-size: 14px;
         }
         
-        .filter-btn {
-            padding: 8px 16px;
+        .signal-right {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+        
+        .score-box {
+            text-align: center;
+            padding: 10px 15px;
+            background: #0f172a;
             border-radius: 6px;
             border: 1px solid var(--border-color);
+        }
+        .score-value {
+            font-weight: bold;
+            font-size: 18px;
+            color: var(--accent-blue);
+        }
+        .score-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 3px;
+        }
+        
+        .change-box {
+            text-align: center;
+            padding: 10px 15px;
             background: #0f172a;
-            color: var(--text-color);
-            cursor: pointer;
-            font-size: 12px;
-            font-weight: 600;
-            transition: all 0.2s;
-        }
-        .filter-btn.active {
-            background: var(--accent-blue);
-            color: #0f172a;
-            border-color: var(--accent-blue);
-        }
-        .filter-btn:hover {
-            border-color: var(--accent-blue);
-        }
-        
-        table { 
-            width: 100%; 
-            border-collapse: collapse;
-        }
-        th, td { 
-            padding: 14px; 
-            text-align: left; 
-            border-bottom: 1px solid var(--border-color); 
-            font-size: 13px;
-        }
-        th { 
-            background-color: #111827; 
-            color: var(--text-muted); 
-            font-size: 11px; 
-            text-transform: uppercase;
-            font-weight: 600;
-        }
-        tr:hover { background-color: rgba(56, 189, 248, 0.05); }
-        
-        .badge { 
-            padding: 6px 12px; 
-            border-radius: 6px; 
-            font-weight: bold; 
-            font-size: 10px;
-            display: inline-block;
-            white-space: nowrap;
-        }
-        .badge-attack { 
-            background: rgba(239, 68, 68, 0.2); 
-            color: var(--sell-color); 
-            border: 1px solid var(--sell-color);
-        }
-        .badge-dip { 
-            background: rgba(245, 158, 11, 0.2); 
-            color: var(--orange); 
-            border: 1px solid var(--orange);
-        }
-        .badge-momentum { 
-            background: rgba(34, 197, 94, 0.2); 
-            color: var(--buy-color); 
-            border: 1px solid var(--buy-color);
-        }
-        
-        .price-up { color: var(--buy-color); font-weight: 600; }
-        .price-down { color: var(--sell-color); font-weight: 600; }
-        
-        .volume-spike { 
-            color: var(--sell-color); 
-            font-weight: 600;
-        }
-        
-        .confidence-bar {
-            width: 100%;
-            height: 20px;
-            background: #0f172a;
-            border-radius: 4px;
-            overflow: hidden;
+            border-radius: 6px;
             border: 1px solid var(--border-color);
         }
-        .confidence-fill {
-            height: 100%;
-            background: linear-gradient(90deg, var(--buy-color), var(--accent-blue));
-            transition: width 0.3s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 11px;
+        .change-24h {
             font-weight: 600;
-            color: #0f172a;
+            font-size: 14px;
+        }
+        .change-7d {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 3px;
         }
         
         .empty-state {
@@ -382,10 +461,9 @@ HTML_TEMPLATE = """
         
         @media (max-width: 768px) {
             header { flex-direction: column; gap: 15px; }
-            .stats { flex-direction: column; gap: 10px; }
-            table { font-size: 11px; }
-            th, td { padding: 10px 6px; }
-            .badge { padding: 4px 8px; }
+            .stats { flex-direction: column; }
+            .signal-item { flex-direction: column; align-items: flex-start; }
+            .signal-right { width: 100%; margin-top: 12px; }
         }
     </style>
 </head>
@@ -393,136 +471,106 @@ HTML_TEMPLATE = """
     <div class="container">
         <header>
             <div>
-                <h1>🔍 Volatility Scanner</h1>
-                <span style="color: var(--text-muted); font-size: 12px;">Real-time Pump/Dump Tespiti</span>
+                <h1>🤖 Crypto Analyzer Bot</h1>
+                <span style="color: var(--text-muted); font-size: 12px;">Fully Automated Analysis</span>
             </div>
             <div class="stats">
                 <div class="stat">
-                    <span class="stat-value" id="oppCount">0</span>
-                    <span class="stat-label">Fırsat Bulundu</span>
+                    <span class="stat-value" id="analyzed">0</span>
+                    <span class="stat-label">Coins Analyzed</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" style="color: var(--buy-color);" id="buyCount">0</span>
+                    <span class="stat-label">BUY Signals</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" style="color: var(--sell-color);" id="sellCount">0</span>
+                    <span class="stat-label">SELL Signals</span>
                 </div>
                 <div class="stat">
                     <span class="stat-value" id="lastUpdate">--:--</span>
-                    <span class="stat-label">Son Güncelleme</span>
+                    <span class="stat-label">Last Update</span>
                 </div>
                 <div class="stat">
-                    <span class="status-badge loading" id="status">● Taranıyor...</span>
+                    <span class="status-badge loading" id="status">● Analyzing...</span>
                 </div>
             </div>
         </header>
 
         <div class="card">
-            <h3>📊 Anlık Volatilite Fırsatları</h3>
+            <h3>📊 Live Trading Signals</h3>
             
-            <div class="controls">
-                <button class="filter-btn active" onclick="filterTable('all')">Tümü</button>
-                <button class="filter-btn" onclick="filterTable('VOLATİL ATAK (AL)')">🔥 Volatil Atak</button>
-                <button class="filter-btn" onclick="filterTable('DİP FIRSATI')">🎯 Dip Fırsatı</button>
-                <button class="filter-btn" onclick="filterTable('GÜÇLÜ MOMENTUM')">📈 Momentum</button>
+            <div id="signalsContainer">
+                <div class="empty-state loading">
+                    Analyzing market data...
+                </div>
             </div>
-
-            <table>
-                <thead>
-                    <tr>
-                        <th>Coin</th>
-                        <th>Fiyat</th>
-                        <th>1h Değişim</th>
-                        <th>24h Değişim</th>
-                        <th>Volume Spike</th>
-                        <th>Sinyal</th>
-                        <th>Güven</th>
-                        <th>Saat</th>
-                    </tr>
-                </thead>
-                <tbody id="tableBody">
-                    <tr>
-                        <td colspan="8" class="empty-state">
-                            <div class="loading">Veriler yükleniyor...</div>
-                        </td>
-                    </tr>
-                </tbody>
-            </table>
         </div>
     </div>
 
     <script>
-        let currentFilter = 'all';
-
-        function updateTable() {
-            fetch('/api/data')
+        function updateSignals() {
+            fetch('/api/signals')
                 .then(r => r.json())
                 .then(data => {
-                    const tbody = document.getElementById('tableBody');
-                    
-                    document.getElementById('oppCount').textContent = data.opportunities.length;
+                    document.getElementById('analyzed').textContent = data.total_analyzed;
+                    document.getElementById('buyCount').textContent = data.buy_count;
+                    document.getElementById('sellCount').textContent = data.sell_count;
                     document.getElementById('lastUpdate').textContent = data.last_update || '--:--';
-                    
-                    const status = document.getElementById('status');
-                    status.textContent = data.status;
-                    if (data.status.includes('Hazır')) {
-                        status.classList.remove('loading');
-                    } else {
-                        status.classList.add('loading');
+                    document.getElementById('status').textContent = data.status;
+
+                    if (data.status.includes('Analyzed')) {
+                        document.getElementById('status').classList.remove('loading');
                     }
 
-                    if (data.opportunities.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="8" class="empty-state">Henüz fırsat bulunmadı. Tarama devam ediyor...</td></tr>';
+                    const container = document.getElementById('signalsContainer');
+                    
+                    if (data.recommendations.length === 0) {
+                        container.innerHTML = '<div class="empty-state">No strong signals yet. Bot is analyzing...</div>';
                         return;
                     }
 
-                    tbody.innerHTML = data.opportunities.map(opp => {
-                        let badgeClass = 'badge-momentum';
-                        if (opp.signal.includes('ATAK')) badgeClass = 'badge-attack';
-                        if (opp.signal.includes('DİP')) badgeClass = 'badge-dip';
-
-                        const change1hClass = parseFloat(opp.change_1h) >= 0 ? 'price-up' : 'price-down';
-                        const change24hClass = parseFloat(opp.change_24h) >= 0 ? 'price-up' : 'price-down';
-
+                    container.innerHTML = data.recommendations.map(rec => {
+                        const isBuy = rec.signal.includes('BUY');
+                        const itemClass = isBuy ? 'buy' : 'sell';
+                        
+                        const change24h = parseFloat(rec.change_24h);
+                        const change24hClass = change24h >= 0 ? 'color: var(--buy-color)' : 'color: var(--sell-color)';
+                        
                         return `
-                            <tr class="data-row" data-signal="${opp.signal}">
-                                <td><strong>${opp.name}</strong></td>
-                                <td>${opp.price}</td>
-                                <td class="${change1hClass}">${opp.change_1h}</td>
-                                <td class="${change24hClass}">${opp.change_24h}</td>
-                                <td class="volume-spike">${opp.volume_spike}</td>
-                                <td><span class="badge ${badgeClass}">${opp.signal}</span></td>
-                                <td>
-                                    <div class="confidence-bar">
-                                        <div class="confidence-fill" style="width: ${opp.confidence}%">
-                                            ${opp.confidence}%
-                                        </div>
+                            <div class="signal-item ${itemClass}">
+                                <div class="signal-left">
+                                    <div class="signal-badge">${rec.signal}</div>
+                                    <div class="signal-info">
+                                        <h4>${rec.symbol}</h4>
+                                        <p>${rec.name}</p>
+                                        <p>${rec.price}</p>
+                                        <p>${rec.timestamp}</p>
                                     </div>
-                                </td>
-                                <td>${opp.timestamp}</td>
-                            </tr>
+                                </div>
+                                <div class="signal-right">
+                                    <div class="change-box">
+                                        <div class="change-24h" style="${change24hClass}">${rec.change_24h}</div>
+                                        <div class="change-7d">${rec.change_7d}</div>
+                                    </div>
+                                    <div class="score-box">
+                                        <div class="score-value">${rec.score}</div>
+                                        <div class="score-label">Score</div>
+                                    </div>
+                                    <div class="score-box">
+                                        <div class="score-value">${rec.confidence}%</div>
+                                        <div class="score-label">Confidence</div>
+                                    </div>
+                                </div>
+                            </div>
                         `;
                     }).join('');
-
-                    filterTable(currentFilter);
                 })
-                .catch(err => {
-                    console.error('Error:', err);
-                    document.getElementById('status').textContent = '❌ Bağlantı hatası';
-                });
+                .catch(err => console.error('Error:', err));
         }
 
-        function filterTable(signal) {
-            currentFilter = signal;
-            document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
-            event?.target?.classList.add('active');
-
-            document.querySelectorAll('.data-row').forEach(row => {
-                if (signal === 'all' || row.getAttribute('data-signal') === signal) {
-                    row.style.display = '';
-                } else {
-                    row.style.display = 'none';
-                }
-            });
-        }
-
-        // İlk yükleme + her 10 saniyede güncelle
-        updateTable();
-        setInterval(updateTable, 10000);
+        updateSignals();
+        setInterval(updateSignals, 10000);
     </script>
 </body>
 </html>
@@ -532,9 +580,9 @@ HTML_TEMPLATE = """
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route("/api/data")
-def api_data():
-    return jsonify(scanner_data)
+@app.route("/api/signals")
+def api_signals():
+    return jsonify(bot_data)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
