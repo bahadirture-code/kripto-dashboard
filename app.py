@@ -2,23 +2,19 @@ from flask import Flask, render_template_string, jsonify
 import requests
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import sqlite3
 import json
-import os
 
 app = Flask(__name__)
 
-# Database setup
 DB_FILE = "crypto_recommendations.db"
 
 def init_db():
-    """Database'i başlat"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS recommendations (
         id INTEGER PRIMARY KEY,
-        coin_id TEXT,
         symbol TEXT,
         price REAL,
         signal TEXT,
@@ -31,21 +27,19 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_recommendation(coin_id, symbol, price, signal, score, confidence, change_24h, change_7d):
-    """Öneriye DB'ye kaydet"""
+def save_recommendation(symbol, price, signal, score, confidence, change_24h, change_7d):
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute('''INSERT INTO recommendations 
-                     (coin_id, symbol, price, signal, score, confidence, timestamp, change_24h, change_7d)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (coin_id, symbol, price, signal, score, confidence, datetime.now(), change_24h, change_7d))
+                     (symbol, price, signal, score, confidence, timestamp, change_24h, change_7d)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (symbol, price, signal, score, confidence, datetime.now(), change_24h, change_7d))
         conn.commit()
         conn.close()
     except:
         pass
 
-# Global veri
 bot_data = {
     "last_update": None,
     "status": "Başlatılıyor...",
@@ -56,103 +50,60 @@ bot_data = {
     "hold_count": 0
 }
 
-COINGECKO_API = "https://api.coingecko.com/api/v3"
-
 def get_top_coins():
-    """Top 100 coini al"""
+    """CoinGecko'dan top 50 coini al"""
     try:
-        url = f"{COINGECKO_API}/coins/markets"
+        url = "https://api.coingecko.com/api/v3/coins/markets"
         params = {
             "vs_currency": "usd",
             "order": "market_cap_desc",
-            "per_page": 100,
-            "price_change_percentage": "1h,24h,7d"
+            "per_page": 50,
+            "price_change_percentage": "24h,7d"
         }
-        response = requests.get(url, params=params, timeout=15)
-        data = response.json()
-        print(f"[DEBUG] {len(data)} coin getiridi")
-        return data
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            print(f"✓ {len(data)} coin alındı")
+            return data
     except Exception as e:
-        print(f"Coin getirme hatası: {e}")
-        return []
+        print(f"API hatası: {e}")
+    return []
 
-def analyze_and_recommend(coin):
-    """Coin'i analiz et ve tavsiye ver"""
+def analyze_coin(coin):
+    """Basit ve doğru analiz"""
     try:
-        score = 50
-        confidence = 30
-        
         change_24h = coin.get("price_change_percentage_24h") or 0
         change_7d = coin.get("price_change_percentage_7d") or 0
-        market_cap = coin.get("market_cap") or 0
-        ath = coin.get("ath") or coin.get("current_price") or 1
-        current_price = coin.get("current_price") or 1
         
-        # Market cap faktörü
-        if market_cap and market_cap > 500000000:  # $500M+
-            confidence += 15
-        elif market_cap and market_cap > 100000000:  # $100M+
-            confidence += 10
+        score = 50
         
-        # 24h momentum - GÜÇLÜ SINYAL
-        if change_24h > 5:
-            score += 20
-            confidence += 15
-        elif change_24h > 2:
-            score += 10
-            confidence += 8
+        # Basit algoritma
+        if change_24h > 3:
+            score += 15
         elif change_24h > 0:
-            score += 5
-            confidence += 3
-        elif change_24h < -5:
-            score -= 20
-            confidence += 15
-        elif change_24h < -2:
-            score -= 10
-            confidence += 8
+            score += 8
+        elif change_24h < -3:
+            score -= 15
         elif change_24h < 0:
-            score -= 5
-            confidence += 3
+            score -= 8
         
-        # 7d trend - ÖNEMLİ SINYAL
-        if change_7d > 10:
-            score += 18
-            confidence += 12
-        elif change_7d > 5:
-            score += 10
-            confidence += 8
-        elif change_7d < -10:
-            score -= 18
-            confidence += 12
-        elif change_7d < -5:
-            score -= 10
-            confidence += 8
-        
-        # ATH mesafesi
-        if ath > 0 and current_price > 0:
-            distance_from_ath = ((ath - current_price) / ath) * 100
-            
-            if distance_from_ath > 60:
-                score += 12
-                confidence += 8
-            elif distance_from_ath > 40:
-                score += 8
-                confidence += 5
-            elif distance_from_ath < 5:
-                score -= 8
+        if change_7d > 8:
+            score += 12
+        elif change_7d < -8:
+            score -= 12
         
         score = max(0, min(100, score))
-        confidence = max(0, min(100, confidence))
+        confidence = 60
         
-        # Tavsiye ver - GENİŞ FİLTRE
-        if score >= 65:
+        # Tavsiye
+        if score >= 70:
             signal = "🟢 ALIŞ"
-        elif score >= 55:
-            signal = "🟡 ALIŞ (DİKKAT)"
-        elif score <= 35:
+        elif score >= 60:
+            signal = "🟡 ALIŞ"
+        elif score <= 30:
             signal = "🔴 SATIŞ"
-        elif score <= 45:
-            signal = "🔴 SATIŞ (DİKKAT)"
+        elif score <= 40:
+            signal = "🔴 SATIŞ"
         else:
             signal = "⚪ BEKLE"
         
@@ -163,26 +114,24 @@ def analyze_and_recommend(coin):
             "change_24h": change_24h,
             "change_7d": change_7d
         }
-        
-    except Exception as e:
-        print(f"Analiz hatası: {e}")
+    except:
         return None
 
 def run_bot():
-    """Bot analiz döngüsü"""
     global bot_data
-    
     init_db()
-    first_run = True
+    
+    print("🤖 Bot başlatılıyor...")
     
     while True:
         try:
             bot_data["status"] = "Analiz ediliyor..."
             
             coins = get_top_coins()
+            
             if not coins:
                 bot_data["status"] = "❌ Veri alınamadı"
-                time.sleep(60)
+                time.sleep(30)
                 continue
             
             recommendations = []
@@ -192,31 +141,22 @@ def run_bot():
             
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {len(coins)} coin analiz ediliyor...")
             
-            for i, coin in enumerate(coins):
+            for coin in coins:
                 try:
-                    analysis = analyze_and_recommend(coin)
-                    
+                    analysis = analyze_coin(coin)
                     if not analysis:
                         continue
                     
-                    coin_id = coin.get("id", "")
                     symbol = coin.get("symbol", "").upper()
-                    price = coin.get("current_price", 0)
                     name = coin.get("name", "")
+                    price = coin.get("current_price", 0)
                     
-                    # DB'ye kaydet
                     save_recommendation(
-                        coin_id,
-                        symbol,
-                        price,
-                        analysis["signal"],
-                        analysis["score"],
-                        analysis["confidence"],
-                        analysis["change_24h"],
-                        analysis["change_7d"]
+                        symbol, price, analysis["signal"],
+                        analysis["score"], analysis["confidence"],
+                        analysis["change_24h"], analysis["change_7d"]
                     )
                     
-                    # Tüm sinyalleri kaydet (STRONG değil, normal)
                     if "ALIŞ" in analysis["signal"]:
                         buy_count += 1
                         recommendations.append({
@@ -245,15 +185,11 @@ def run_bot():
                         })
                     else:
                         hold_count += 1
-                    
-                    if (i + 1) % 25 == 0:
-                        print(f"  {i+1}/{len(coins)} tamamlandı...")
                 
                 except Exception as e:
-                    print(f"Coin analiz hatası: {e}")
+                    print(f"Coin hatası: {e}")
                     continue
             
-            # Sıralama (score'a göre)
             recommendations.sort(key=lambda x: x["score"], reverse=True)
             
             bot_data["recommendations"] = recommendations
@@ -262,22 +198,17 @@ def run_bot():
             bot_data["buy_count"] = buy_count
             bot_data["sell_count"] = sell_count
             bot_data["hold_count"] = hold_count
-            bot_data["status"] = f"✓ {len(coins)} coin analiz | {len(recommendations)} sinyal bulundu"
+            bot_data["status"] = f"✓ {len(coins)} coin | {len(recommendations)} sinyal"
             
-            print(f"SONUÇ: ALIŞ={buy_count}, SATIŞ={sell_count}, BEKLE={hold_count}, TOTAL={len(recommendations)} sinyal")
+            print(f"ALIŞ: {buy_count}, SATIŞ: {sell_count}, BEKLE: {hold_count}, TOPLAM: {len(recommendations)}")
             
-            if first_run:
-                print("✓ Bot başlatıldı, canlı tarama başladı!")
-                first_run = False
-            
-            time.sleep(300)  # Her 5 dakika
+            time.sleep(300)
             
         except Exception as e:
-            bot_data["status"] = f"❌ Hata: {str(e)}"
-            print(f"Bot hatası: {e}")
+            bot_data["status"] = f"❌ {str(e)}"
+            print(f"Hata: {e}")
             time.sleep(60)
 
-# Bot thread başlat
 bot_thread = threading.Thread(target=run_bot, daemon=True)
 bot_thread.start()
 
@@ -297,7 +228,6 @@ HTML_TEMPLATE = """
             --accent-blue: #38bdf8;
             --buy-color: #22c55e;
             --sell-color: #ef4444;
-            --hold-color: #f59e0b;
             --border-color: #334155;
         }
         * { box-sizing: border-box; }
@@ -351,15 +281,13 @@ HTML_TEMPLATE = """
             padding: 24px;
             border: 1px solid var(--border-color);
             box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-            margin-bottom: 25px;
         }
         .card h3 { margin-top: 0; color: var(--text-muted); }
         
         .signal-item {
             padding: 15px;
-            border-left: 4px solid var(--border-color);
+            border-left: 4px solid;
             margin-bottom: 12px;
-            background: rgba(56, 189, 248, 0.05);
             border-radius: 6px;
             display: flex;
             justify-content: space-between;
@@ -367,11 +295,11 @@ HTML_TEMPLATE = """
         }
         .signal-item.buy {
             border-left-color: var(--buy-color);
-            background: rgba(34, 197, 94, 0.05);
+            background: rgba(34, 197, 94, 0.1);
         }
         .signal-item.sell {
             border-left-color: var(--sell-color);
-            background: rgba(239, 68, 68, 0.05);
+            background: rgba(239, 68, 68, 0.1);
         }
         
         .signal-left {
@@ -389,51 +317,25 @@ HTML_TEMPLATE = """
             font-size: 12px;
             color: var(--text-muted);
         }
-        .signal-badge {
-            font-weight: 600;
-            font-size: 14px;
-            min-width: 120px;
-        }
         
         .signal-right {
             display: flex;
-            gap: 15px;
+            gap: 10px;
             align-items: center;
         }
         
-        .score-box {
+        .box {
             text-align: center;
-            padding: 10px 15px;
+            padding: 8px 12px;
             background: #0f172a;
-            border-radius: 6px;
+            border-radius: 4px;
             border: 1px solid var(--border-color);
+            font-size: 12px;
         }
-        .score-value {
+        .box-value {
             font-weight: bold;
-            font-size: 18px;
+            font-size: 16px;
             color: var(--accent-blue);
-        }
-        .score-label {
-            font-size: 11px;
-            color: var(--text-muted);
-            margin-top: 3px;
-        }
-        
-        .change-box {
-            text-align: center;
-            padding: 10px 15px;
-            background: #0f172a;
-            border-radius: 6px;
-            border: 1px solid var(--border-color);
-        }
-        .change-24h {
-            font-weight: 600;
-            font-size: 14px;
-        }
-        .change-7d {
-            font-size: 11px;
-            color: var(--text-muted);
-            margin-top: 3px;
         }
         
         .empty-state {
@@ -444,13 +346,6 @@ HTML_TEMPLATE = """
         
         .loading { animation: pulse 1s infinite; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        
-        @media (max-width: 768px) {
-            header { flex-direction: column; gap: 15px; }
-            .stats { flex-direction: column; }
-            .signal-item { flex-direction: column; align-items: flex-start; }
-            .signal-right { width: 100%; margin-top: 12px; }
-        }
     </style>
 </head>
 <body>
@@ -467,11 +362,11 @@ HTML_TEMPLATE = """
                 </div>
                 <div class="stat">
                     <span class="stat-value" style="color: var(--buy-color);" id="buyCount">0</span>
-                    <span class="stat-label">ALIŞ Sinyali</span>
+                    <span class="stat-label">ALIŞ</span>
                 </div>
                 <div class="stat">
                     <span class="stat-value" style="color: var(--sell-color);" id="sellCount">0</span>
-                    <span class="stat-label">SATIŞ Sinyali</span>
+                    <span class="stat-label">SATIŞ</span>
                 </div>
                 <div class="stat">
                     <span class="stat-value" id="lastUpdate">--:--</span>
@@ -484,18 +379,15 @@ HTML_TEMPLATE = """
         </header>
 
         <div class="card">
-            <h3>📊 Canlı İşlem Sinyalleri</h3>
-            
-            <div id="signalsContainer">
-                <div class="empty-state loading">
-                    Pazar verisi analiz ediliyor...
-                </div>
+            <h3>📊 Canlı Sinyaller</h3>
+            <div id="signals">
+                <div class="empty-state loading">Veriler yükleniyor...</div>
             </div>
         </div>
     </div>
 
     <script>
-        function updateSignals() {
+        function update() {
             fetch('/api/signals')
                 .then(r => r.json())
                 .then(data => {
@@ -505,58 +397,51 @@ HTML_TEMPLATE = """
                     document.getElementById('lastUpdate').textContent = data.last_update || '--:--';
                     document.getElementById('status').textContent = data.status;
 
-                    if (data.status.includes('✓')) {
-                        document.getElementById('status').classList.remove('loading');
-                    }
-
-                    const container = document.getElementById('signalsContainer');
+                    const container = document.getElementById('signals');
                     
-                    if (data.recommendations.length === 0) {
-                        container.innerHTML = '<div class="empty-state">Henüz sinyal bulunamadı. Bot analiz yapıyor...</div>';
+                    if (!data.recommendations || data.recommendations.length === 0) {
+                        container.innerHTML = '<div class="empty-state">Bot analiz yapıyor. Birkaç dakika bekleyin...</div>';
                         return;
                     }
 
-                    container.innerHTML = data.recommendations.map(rec => {
-                        const isBuy = rec.signal.includes('ALIŞ');
-                        const itemClass = isBuy ? 'buy' : 'sell';
-                        
-                        const change24h = parseFloat(rec.change_24h);
-                        const change24hClass = change24h >= 0 ? 'color: var(--buy-color)' : 'color: var(--sell-color)';
+                    container.innerHTML = data.recommendations.map(r => {
+                        const isBuy = r.signal.includes('ALIŞ');
+                        const change24h = parseFloat(r.change_24h);
+                        const priceColor = change24h >= 0 ? 'var(--buy-color)' : 'var(--sell-color)';
                         
                         return `
-                            <div class="signal-item ${itemClass}">
+                            <div class="signal-item ${isBuy ? 'buy' : 'sell'}">
                                 <div class="signal-left">
-                                    <div class="signal-badge">${rec.signal}</div>
+                                    <strong style="font-size: 16px;">${r.signal}</strong>
                                     <div class="signal-info">
-                                        <h4>${rec.symbol}</h4>
-                                        <p>${rec.name}</p>
-                                        <p>${rec.price}</p>
-                                        <p>${rec.timestamp}</p>
+                                        <h4>${r.symbol}</h4>
+                                        <p>${r.name}</p>
+                                        <p>${r.price} | ${r.timestamp}</p>
                                     </div>
                                 </div>
                                 <div class="signal-right">
-                                    <div class="change-box">
-                                        <div class="change-24h" style="${change24hClass}">${rec.change_24h}</div>
-                                        <div class="change-7d">${rec.change_7d}</div>
+                                    <div class="box">
+                                        <div class="box-value" style="color: ${priceColor}">${r.change_24h}</div>
+                                        <div>24h</div>
                                     </div>
-                                    <div class="score-box">
-                                        <div class="score-value">${rec.score}</div>
-                                        <div class="score-label">Skor</div>
+                                    <div class="box">
+                                        <div class="box-value">${r.score}</div>
+                                        <div>Skor</div>
                                     </div>
-                                    <div class="score-box">
-                                        <div class="score-value">${rec.confidence}%</div>
-                                        <div class="score-label">Güven</div>
+                                    <div class="box">
+                                        <div class="box-value">${r.confidence}%</div>
+                                        <div>Güven</div>
                                     </div>
                                 </div>
                             </div>
                         `;
                     }).join('');
                 })
-                .catch(err => console.error('Hata:', err));
+                .catch(e => console.log('Hata:', e));
         }
 
-        updateSignals();
-        setInterval(updateSignals, 10000);
+        update();
+        setInterval(update, 10000);
     </script>
 </body>
 </html>
@@ -571,5 +456,6 @@ def api_signals():
     return jsonify(bot_data)
 
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
