@@ -20,15 +20,6 @@ DB_FILE = "crypto_recommendations.db"
 LOCK = threading.Lock()
 TZ_TR = timezone(timedelta(hours=3))
 
-# --- Proxy ayarları (Render için) ---
-if os.environ.get('RENDER'):
-    proxies = {
-        'http': 'http://proxy.render.com:8080',
-        'https': 'http://proxy.render.com:8080',
-    }
-else:
-    proxies = None
-
 # --- Veritabanı ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -96,16 +87,16 @@ bot_data = {
     "analyzing": False
 }
 
-# --- API'ler (önce CoinCap, başarısızsa CoinGecko) ---
+# --- Proxy ile API istekleri ---
+PROXY_URL = "https://corsproxy.io/?"  # Ücretsiz proxy
+
 def get_coins_from_coincap():
-    url = "https://api.coincap.io/v2/assets"
-    params = {"limit": 50, "sort": "volumeUsd24Hr"}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://coincap.io/"
-    }
+    """CoinCap API üzerinden hacim sıralı coin listesi al (proxy ile)"""
+    target_url = "https://api.coincap.io/v2/assets?limit=50&sort=volumeUsd24Hr"
+    full_url = PROXY_URL + target_url
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=20, proxies=proxies)
+        resp = requests.get(full_url, headers=headers, timeout=20)
         if resp.status_code == 200:
             data = resp.json().get("data", [])
             converted = []
@@ -128,47 +119,40 @@ def get_coins_from_coincap():
                     })
                 except:
                     continue
-            logger.info(f"CoinCap'ten {len(converted)} coin alındı")
+            logger.info(f"CoinCap (proxy) ile {len(converted)} coin alındı")
             return converted
         else:
-            logger.warning(f"CoinCap yanıt kodu: {resp.status_code}")
+            logger.warning(f"CoinCap proxy yanıt kodu: {resp.status_code}")
     except Exception as e:
-        logger.warning(f"CoinCap hatası: {e}")
+        logger.warning(f"CoinCap proxy hatası: {e}")
     return None
 
 def get_coins_from_coingecko():
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "volume_desc",
-        "per_page": 50,
-        "price_change_percentage": "1h,24h",
-        "sparkline": False
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://www.coingecko.com/"
-    }
+    """CoinGecko API (proxy ile)"""
+    target_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=50&price_change_percentage=1h,24h&sparkline=false"
+    full_url = PROXY_URL + target_url
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=20, proxies=proxies)
+        resp = requests.get(full_url, headers=headers, timeout=20)
         if resp.status_code == 200:
             data = resp.json()
-            logger.info(f"CoinGecko'dan {len(data)} coin alındı")
+            logger.info(f"CoinGecko (proxy) ile {len(data)} coin alındı")
             return data
         else:
-            logger.warning(f"CoinGecko yanıt kodu: {resp.status_code}")
+            logger.warning(f"CoinGecko proxy yanıt kodu: {resp.status_code}")
     except Exception as e:
-        logger.warning(f"CoinGecko hatası: {e}")
+        logger.warning(f"CoinGecko proxy hatası: {e}")
     return None
 
 def get_coins_with_volume():
+    """Önce CoinCap proxy, sonra CoinGecko proxy dene"""
     coins = get_coins_from_coincap()
     if coins:
         return coins
-    logger.info("CoinCap başarısız, CoinGecko deneniyor...")
+    logger.info("CoinCap proxy başarısız, CoinGecko proxy deneniyor...")
     return get_coins_from_coingecko() or []
 
-# --- Analiz ---
+# --- Analiz (aynı) ---
 def analyze_volatility(coin):
     try:
         symbol = coin.get("symbol", "").upper()
@@ -243,7 +227,7 @@ def run_analysis():
         
         if not coins:
             with LOCK:
-                bot_data["status"] = "❌ Veri alınamadı - API'lerden cevap yok"
+                bot_data["status"] = "❌ Veri alınamadı - API'lerden cevap yok (proxy denendi)"
                 bot_data["analyzing"] = False
             return
         
