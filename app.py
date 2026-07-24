@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
 import requests
 import threading
 import time
@@ -22,19 +22,20 @@ def init_db():
         confidence INTEGER,
         timestamp DATETIME,
         change_24h REAL,
-        change_7d REAL
+        change_7d REAL,
+        volume_spike REAL
     )''')
     conn.commit()
     conn.close()
 
-def save_recommendation(symbol, price, signal, score, confidence, change_24h, change_7d):
+def save_recommendation(symbol, price, signal, score, confidence, change_24h, change_7d, volume_spike):
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute('''INSERT INTO recommendations 
-                     (symbol, price, signal, score, confidence, timestamp, change_24h, change_7d)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (symbol, price, signal, score, confidence, datetime.now(), change_24h, change_7d))
+                     (symbol, price, signal, score, confidence, timestamp, change_24h, change_7d, volume_spike)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (symbol, price, signal, score, confidence, datetime.now(), change_24h, change_7d, volume_spike))
         conn.commit()
         conn.close()
     except:
@@ -42,67 +43,150 @@ def save_recommendation(symbol, price, signal, score, confidence, change_24h, ch
 
 bot_data = {
     "last_update": None,
-    "status": "Başlatılıyor...",
+    "status": "Hazır",
     "recommendations": [],
     "total_analyzed": 0,
     "buy_count": 0,
     "sell_count": 0,
-    "hold_count": 0
+    "hold_count": 0,
+    "analyzing": False
 }
 
+def get_1h_klines(symbol):
+    """Binance'den son 1h mum verisini al"""
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {
+            "symbol": symbol,
+            "interval": "1m",
+            "limit": 60
+        }
+        response = requests.get(url, params=params, timeout=5)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    return None
+
+def get_24h_volume_avg(klines):
+    """24h volume ortalaması"""
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        # 1h interval'de 24 mum = 24 saat
+        params = {
+            "symbol": klines[0][0] if isinstance(klines, list) and len(klines) > 0 else "BTCUSDT",
+            "interval": "1h",
+            "limit": 24
+        }
+        response = requests.get(url, params=params, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            volumes = [float(k[7]) for k in data]  # Quote asset volume
+            return sum(volumes) / len(volumes) if volumes else 0
+    except:
+        pass
+    return 0
+
 def get_top_coins():
-    """CoinGecko'dan top 50 coini al"""
+    """CoinGecko'dan top 100 coini al - USDT pairing'ler"""
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
         params = {
             "vs_currency": "usd",
             "order": "market_cap_desc",
-            "per_page": 50,
-            "price_change_percentage": "24h,7d"
+            "per_page": 100,
+            "price_change_percentage": "1h,24h"
         }
         response = requests.get(url, params=params, timeout=10)
         if response.status_code == 200:
-            data = response.json()
-            print(f"✓ {len(data)} coin alındı")
-            return data
+            return response.json()
     except Exception as e:
         print(f"API hatası: {e}")
     return []
 
-def analyze_coin(coin):
-    """Basit ve doğru analiz"""
+def analyze_coin_volatility(coin):
+    """HACIM + OYNAKLIK analizi"""
     try:
+        symbol = coin.get("symbol", "").upper()
+        name = coin.get("name", "")
+        price = coin.get("current_price", 0)
+        change_1h = coin.get("price_change_percentage_1h_in_currency") or 0
         change_24h = coin.get("price_change_percentage_24h") or 0
-        change_7d = coin.get("price_change_percentage_7d") or 0
         
+        # Binance symbol
+        if symbol not in ["BTC", "ETH", "BNB", "XRP", "SOL"]:
+            binance_symbol = f"{symbol}USDT"
+        else:
+            binance_symbol = f"{symbol}USDT"
+        
+        # 1h mum verisini al
+        klines_1h = get_1h_klines(binance_symbol)
+        
+        volume_spike = 0
+        
+        if klines_1h and len(klines_1h) > 0:
+            # Son 1 dakika hacmi
+            last_volume = float(klines_1h[-1][7])
+            
+            # Önceki 59 dakikanın ortalaması
+            if len(klines_1h) > 1:
+                prev_volumes = [float(k[7]) for k in klines_1h[:-1]]
+                avg_volume = sum(prev_volumes) / len(prev_volumes)
+                
+                # Volume spike yüzdesi
+                if avg_volume > 0:
+                    volume_spike = ((last_volume - avg_volume) / avg_volume) * 100
+        
+        # OYNAKLLIK SKORU
         score = 50
+        confidence = 40
         
-        # Basit algoritma
-        if change_24h > 3:
-            score += 15
-        elif change_24h > 0:
+        # 1h fiyat oynaklığı (KISA VADELİ)
+        abs_change_1h = abs(change_1h)
+        if abs_change_1h > 2:
+            score += 20
+            confidence += 20
+        elif abs_change_1h > 1:
+            score += 12
+            confidence += 12
+        elif abs_change_1h > 0.5:
             score += 8
+            confidence += 8
+        
+        # Volume spike (HACIM PATLAMASI)
+        if volume_spike > 100:  # 100% artış
+            score += 25
+            confidence += 25
+        elif volume_spike > 50:  # 50% artış
+            score += 18
+            confidence += 18
+        elif volume_spike > 30:  # 30% artış
+            score += 12
+            confidence += 12
+        elif volume_spike > 15:  # 15% artış
+            score += 8
+            confidence += 8
+        
+        # 24h trend (destekle)
+        if change_24h > 3:
+            score += 8
+            confidence += 5
         elif change_24h < -3:
-            score -= 15
-        elif change_24h < 0:
             score -= 8
         
-        if change_7d > 8:
-            score += 12
-        elif change_7d < -8:
-            score -= 12
-        
         score = max(0, min(100, score))
-        confidence = 60
+        confidence = max(0, min(100, confidence))
         
-        # Tavsiye
-        if score >= 70:
+        # Tavsiye - AGRESIF (yüksek volatilite için)
+        if score >= 80 and confidence >= 70:
+            signal = "🟢🔥 HIZLI ALIŞ"
+        elif score >= 70 and confidence >= 60:
             signal = "🟢 ALIŞ"
         elif score >= 60:
-            signal = "🟡 ALIŞ"
-        elif score <= 30:
-            signal = "🔴 SATIŞ"
-        elif score <= 40:
+            signal = "🟡 DİKKAT"
+        elif score <= 20 and confidence >= 60:
+            signal = "🔴🔥 HIZLI SATIŞ"
+        elif score <= 35:
             signal = "🔴 SATIŞ"
         else:
             signal = "⚪ BEKLE"
@@ -111,105 +195,116 @@ def analyze_coin(coin):
             "signal": signal,
             "score": score,
             "confidence": confidence,
+            "change_1h": change_1h,
             "change_24h": change_24h,
-            "change_7d": change_7d
+            "volume_spike": volume_spike
         }
-    except:
+    except Exception as e:
+        print(f"Analiz hatası: {e}")
         return None
 
-def run_bot():
+def run_analysis():
+    """Analiz çalıştır"""
     global bot_data
-    init_db()
     
-    print("🤖 Bot başlatılıyor...")
+    bot_data["analyzing"] = True
+    bot_data["status"] = "Analiz yapılıyor..."
+    
+    try:
+        coins = get_top_coins()
+        
+        if not coins:
+            bot_data["status"] = "❌ Veri alınamadı"
+            bot_data["analyzing"] = False
+            return
+        
+        recommendations = []
+        buy_count = 0
+        sell_count = 0
+        hold_count = 0
+        
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] HACIM + OYNAKLLIK ANALİZİ: {len(coins)} coin")
+        
+        for i, coin in enumerate(coins):
+            try:
+                analysis = analyze_coin_volatility(coin)
+                if not analysis:
+                    continue
+                
+                symbol = coin.get("symbol", "").upper()
+                name = coin.get("name", "")
+                price = coin.get("current_price", 0)
+                
+                save_recommendation(
+                    symbol, price, analysis["signal"],
+                    analysis["score"], analysis["confidence"],
+                    analysis["change_1h"], analysis["change_24h"],
+                    analysis["volume_spike"]
+                )
+                
+                # Yüksek volatilite ve hacim sinyalleri
+                if "ALIŞ" in analysis["signal"] or "SATIŞ" in analysis["signal"]:
+                    is_buy = "ALIŞ" in analysis["signal"]
+                    
+                    recommendations.append({
+                        "symbol": symbol,
+                        "name": name,
+                        "price": f"${price:.4f}" if price < 1 else f"${price:.2f}",
+                        "signal": analysis["signal"],
+                        "score": analysis["score"],
+                        "confidence": analysis["confidence"],
+                        "change_1h": f"{analysis['change_1h']:+.2f}%",
+                        "change_24h": f"{analysis['change_24h']:+.2f}%",
+                        "volume_spike": f"{analysis['volume_spike']:+.1f}%",
+                        "timestamp": datetime.now().strftime("%H:%M:%S")
+                    })
+                    
+                    if is_buy:
+                        buy_count += 1
+                    else:
+                        sell_count += 1
+                else:
+                    hold_count += 1
+                
+                if (i + 1) % 20 == 0:
+                    print(f"  {i+1}/{len(coins)} işlendi...")
+            
+            except Exception as e:
+                continue
+        
+        # Skora göre sırala
+        recommendations.sort(key=lambda x: x["score"], reverse=True)
+        
+        bot_data["recommendations"] = recommendations[:30]
+        bot_data["last_update"] = datetime.now().strftime("%H:%M:%S")
+        bot_data["total_analyzed"] = len(coins)
+        bot_data["buy_count"] = buy_count
+        bot_data["sell_count"] = sell_count
+        bot_data["hold_count"] = hold_count
+        bot_data["status"] = f"✓ {len(coins)} coin | {len(recommendations)} VOLATIL coin bulundu"
+        bot_data["analyzing"] = False
+        
+        print(f"\n✓ ALIŞ: {buy_count}, SATIŞ: {sell_count}, BEKLE: {hold_count}, TOPLAM: {len(recommendations)} volatil coin")
+        
+    except Exception as e:
+        bot_data["status"] = f"❌ {str(e)}"
+        bot_data["analyzing"] = False
+        print(f"Hata: {e}")
+
+def auto_bot_loop():
+    """Otomatik analiz (her 5 dakika)"""
+    init_db()
+    print("🤖 Otomatik bot başlatıldı (Her 5 dakika)")
     
     while True:
         try:
-            bot_data["status"] = "Analiz ediliyor..."
-            
-            coins = get_top_coins()
-            
-            if not coins:
-                bot_data["status"] = "❌ Veri alınamadı"
-                time.sleep(30)
-                continue
-            
-            recommendations = []
-            buy_count = 0
-            sell_count = 0
-            hold_count = 0
-            
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {len(coins)} coin analiz ediliyor...")
-            
-            for coin in coins:
-                try:
-                    analysis = analyze_coin(coin)
-                    if not analysis:
-                        continue
-                    
-                    symbol = coin.get("symbol", "").upper()
-                    name = coin.get("name", "")
-                    price = coin.get("current_price", 0)
-                    
-                    save_recommendation(
-                        symbol, price, analysis["signal"],
-                        analysis["score"], analysis["confidence"],
-                        analysis["change_24h"], analysis["change_7d"]
-                    )
-                    
-                    if "ALIŞ" in analysis["signal"]:
-                        buy_count += 1
-                        recommendations.append({
-                            "symbol": symbol,
-                            "name": name,
-                            "price": f"${price:.4f}" if price < 1 else f"${price:.2f}",
-                            "signal": analysis["signal"],
-                            "score": analysis["score"],
-                            "confidence": analysis["confidence"],
-                            "change_24h": f"{analysis['change_24h']:+.2f}%",
-                            "change_7d": f"{analysis['change_7d']:+.2f}%",
-                            "timestamp": datetime.now().strftime("%H:%M:%S")
-                        })
-                    elif "SATIŞ" in analysis["signal"]:
-                        sell_count += 1
-                        recommendations.append({
-                            "symbol": symbol,
-                            "name": name,
-                            "price": f"${price:.4f}" if price < 1 else f"${price:.2f}",
-                            "signal": analysis["signal"],
-                            "score": analysis["score"],
-                            "confidence": analysis["confidence"],
-                            "change_24h": f"{analysis['change_24h']:+.2f}%",
-                            "change_7d": f"{analysis['change_7d']:+.2f}%",
-                            "timestamp": datetime.now().strftime("%H:%M:%S")
-                        })
-                    else:
-                        hold_count += 1
-                
-                except Exception as e:
-                    print(f"Coin hatası: {e}")
-                    continue
-            
-            recommendations.sort(key=lambda x: x["score"], reverse=True)
-            
-            bot_data["recommendations"] = recommendations
-            bot_data["last_update"] = datetime.now().strftime("%H:%M:%S")
-            bot_data["total_analyzed"] = len(coins)
-            bot_data["buy_count"] = buy_count
-            bot_data["sell_count"] = sell_count
-            bot_data["hold_count"] = hold_count
-            bot_data["status"] = f"✓ {len(coins)} coin | {len(recommendations)} sinyal"
-            
-            print(f"ALIŞ: {buy_count}, SATIŞ: {sell_count}, BEKLE: {hold_count}, TOPLAM: {len(recommendations)}")
-            
-            time.sleep(300)
-            
+            run_analysis()
+            time.sleep(300)  # 5 dakika
         except Exception as e:
-            bot_data["status"] = f"❌ {str(e)}"
-            print(f"Hata: {e}")
+            print(f"Loop hatası: {e}")
             time.sleep(60)
 
-bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread = threading.Thread(target=auto_bot_loop, daemon=True)
 bot_thread.start()
 
 HTML_TEMPLATE = """
@@ -218,7 +313,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kripto Analiz Botu</title>
+    <title>Hacim Patlaması Analiz Botu</title>
     <style>
         :root {
             --bg-color: #0f172a;
@@ -281,8 +376,39 @@ HTML_TEMPLATE = """
             padding: 24px;
             border: 1px solid var(--border-color);
             box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            margin-bottom: 25px;
         }
         .card h3 { margin-top: 0; color: var(--text-muted); }
+        
+        .buttons {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border-radius: 6px;
+            border: none;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 14px;
+            transition: opacity 0.2s;
+        }
+        
+        .btn-analyze {
+            background: var(--accent-blue);
+            color: #0f172a;
+        }
+        
+        .btn-analyze:hover:not(:disabled) {
+            opacity: 0.9;
+        }
+        
+        .btn-analyze:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
         
         .signal-item {
             padding: 15px;
@@ -330,11 +456,11 @@ HTML_TEMPLATE = """
             background: #0f172a;
             border-radius: 4px;
             border: 1px solid var(--border-color);
-            font-size: 12px;
+            font-size: 11px;
         }
         .box-value {
             font-weight: bold;
-            font-size: 16px;
+            font-size: 14px;
             color: var(--accent-blue);
         }
         
@@ -352,8 +478,8 @@ HTML_TEMPLATE = """
     <div class="container">
         <header>
             <div>
-                <h1>🤖 Kripto Analiz Botu</h1>
-                <span style="color: var(--text-muted); font-size: 12px;">Otomatik Analiz Sistemi</span>
+                <h1>🚀 Hacim Patlaması Analiz Botu</h1>
+                <span style="color: var(--text-muted); font-size: 12px;">Volatilite + Hacim Tarayıcı</span>
             </div>
             <div class="stats">
                 <div class="stat">
@@ -373,20 +499,50 @@ HTML_TEMPLATE = """
                     <span class="stat-label">Son Güncelleme</span>
                 </div>
                 <div class="stat">
-                    <span class="status-badge loading" id="status">● Başlatılıyor...</span>
+                    <span class="status-badge" id="status">Hazır</span>
                 </div>
             </div>
         </header>
 
         <div class="card">
-            <h3>📊 Canlı Sinyaller</h3>
+            <div class="buttons">
+                <button class="btn btn-analyze" id="analyzeBtn" onclick="startAnalysis()">
+                    🔄 ANALİZ YAP
+                </button>
+                <span id="analyzeStatus" style="color: var(--text-muted); align-self: center;"></span>
+            </div>
+
+            <h3>📊 Volatil Coinler</h3>
             <div id="signals">
-                <div class="empty-state loading">Veriler yükleniyor...</div>
+                <div class="empty-state">Analiz yapmak için butona basın yada otomatik analizin tamamlanmasını bekleyin...</div>
             </div>
         </div>
     </div>
 
     <script>
+        function startAnalysis() {
+            const btn = document.getElementById('analyzeBtn');
+            const status = document.getElementById('analyzeStatus');
+            
+            btn.disabled = true;
+            status.textContent = "Analiz yapılıyor...";
+            
+            fetch('/api/analyze', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    status.textContent = "✓ Tamamlandı";
+                    setTimeout(() => { status.textContent = ""; }, 2000);
+                })
+                .catch(e => {
+                    status.textContent = "❌ Hata";
+                    console.log('Error:', e);
+                })
+                .finally(() => {
+                    btn.disabled = false;
+                    update();
+                });
+        }
+
         function update() {
             fetch('/api/signals')
                 .then(r => r.json())
@@ -400,14 +556,14 @@ HTML_TEMPLATE = """
                     const container = document.getElementById('signals');
                     
                     if (!data.recommendations || data.recommendations.length === 0) {
-                        container.innerHTML = '<div class="empty-state">Bot analiz yapıyor. Birkaç dakika bekleyin...</div>';
+                        container.innerHTML = '<div class="empty-state">Henüz volatil coin bulunmadı</div>';
                         return;
                     }
 
                     container.innerHTML = data.recommendations.map(r => {
                         const isBuy = r.signal.includes('ALIŞ');
-                        const change24h = parseFloat(r.change_24h);
-                        const priceColor = change24h >= 0 ? 'var(--buy-color)' : 'var(--sell-color)';
+                        const change1h = parseFloat(r.change_1h);
+                        const priceColor = change1h >= 0 ? 'var(--buy-color)' : 'var(--sell-color)';
                         
                         return `
                             <div class="signal-item ${isBuy ? 'buy' : 'sell'}">
@@ -421,16 +577,16 @@ HTML_TEMPLATE = """
                                 </div>
                                 <div class="signal-right">
                                     <div class="box">
-                                        <div class="box-value" style="color: ${priceColor}">${r.change_24h}</div>
-                                        <div>24h</div>
+                                        <div class="box-value" style="color: ${priceColor}">${r.change_1h}</div>
+                                        <div>1h</div>
+                                    </div>
+                                    <div class="box">
+                                        <div class="box-value" style="color: ${change1h >= 0 ? 'var(--buy-color)' : 'var(--sell-color)'}">${r.volume_spike}</div>
+                                        <div>Hacim</div>
                                     </div>
                                     <div class="box">
                                         <div class="box-value">${r.score}</div>
                                         <div>Skor</div>
-                                    </div>
-                                    <div class="box">
-                                        <div class="box-value">${r.confidence}%</div>
-                                        <div>Güven</div>
                                     </div>
                                 </div>
                             </div>
@@ -454,6 +610,12 @@ def index():
 @app.route("/api/signals")
 def api_signals():
     return jsonify(bot_data)
+
+@app.route("/api/analyze", methods=["POST"])
+def api_analyze():
+    """Manual analiz çalıştır"""
+    threading.Thread(target=run_analysis, daemon=True).start()
+    return jsonify({"status": "Analiz başlatıldı"})
 
 if __name__ == "__main__":
     import os
