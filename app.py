@@ -19,12 +19,24 @@ app = Flask(__name__)
 DB_FILE = "crypto_recommendations.db"
 LOCK = threading.Lock()
 
-# Türkiye saati için UTC+3
-TURKEY_OFFSET = timedelta(hours=3)
-
-def get_turkey_time():
-    """Türkiye saati (UTC+3) döndür"""
-    return datetime.utcnow() + TURKEY_OFFSET
+# --- Türkiye saati (UTC+3) - ZoneInfo yoksa manuel offset ---
+try:
+    from zoneinfo import ZoneInfo
+    TZ_TR = ZoneInfo("Europe/Istanbul")
+except Exception:
+    # ZoneInfo yoksa veya timezone verisi yoksa UTC+3 kullan
+    class SimpleTZ:
+        def __init__(self, offset_hours=3):
+            self.offset = timedelta(hours=offset_hours)
+        def __repr__(self):
+            return f"UTC+{self.offset.total_seconds()//3600:.0f}"
+    TZ_TR = SimpleTZ(3)
+    # datetime.now(TZ_TR) çalışmaz, bu yüzden bir fonksiyon tanımlayalım
+    def now_tr():
+        return datetime.utcnow() + timedelta(hours=3)
+else:
+    def now_tr():
+        return datetime.now(TZ_TR)
 
 # --- Veritabanı ---
 def init_db():
@@ -139,28 +151,21 @@ def analyze_volatility(coin):
         confidence = 40
         abs_1h = abs(change_1h)
         if abs_1h > 3:
-            score += 25
-            confidence += 25
+            score += 25; confidence += 25
         elif abs_1h > 1.5:
-            score += 15
-            confidence += 15
+            score += 15; confidence += 15
         elif abs_1h > 0.5:
-            score += 8
-            confidence += 8
+            score += 8; confidence += 8
         if change_24h > 5:
-            score += 12
-            confidence += 10
+            score += 12; confidence += 10
         elif change_24h < -5:
             score -= 12
         if volume_ratio > 50:
-            score += 15
-            confidence += 15
+            score += 15; confidence += 15
         elif volume_ratio > 30:
-            score += 10
-            confidence += 10
+            score += 10; confidence += 10
         elif volume_ratio > 20:
-            score += 5
-            confidence += 5
+            score += 5; confidence += 5
         score = max(0, min(100, score))
         confidence = max(0, min(100, confidence))
         
@@ -234,7 +239,7 @@ def run_analysis():
                     "change_1h": f"{analysis['change_1h']:+.2f}%",
                     "change_24h": f"{analysis['change_24h']:+.2f}%",
                     "volume": f"{analysis['volume_ratio']:.1f}%",
-                    "timestamp": get_turkey_time().strftime("%H:%M:%S")
+                    "timestamp": now_tr().strftime("%H:%M:%S")
                 })
                 if is_buy:
                     buy_count += 1
@@ -249,7 +254,7 @@ def run_analysis():
         
         with LOCK:
             bot_data["recommendations"] = recommendations
-            bot_data["last_update"] = get_turkey_time().strftime("%H:%M:%S")
+            bot_data["last_update"] = now_tr().strftime("%H:%M:%S")
             bot_data["total_analyzed"] = len(coins)
             bot_data["buy_count"] = buy_count
             bot_data["sell_count"] = sell_count
