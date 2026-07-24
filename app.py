@@ -9,7 +9,7 @@ import os
 
 # --- Loglama ---
 logging.basicConfig(
-    level=logging.DEBUG,  # DEBUG seviyesine alalım
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -87,8 +87,8 @@ bot_data = {
     "analyzing": False
 }
 
-# --- CoinGecko API (geliştirilmiş loglama) ---
-def get_coins_with_volume(retries=3, delay=3):
+# --- CoinGecko API ---
+def get_coins_from_coingecko(retries=2, delay=2):
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
@@ -102,67 +102,116 @@ def get_coins_with_volume(retries=3, delay=3):
     }
     for attempt in range(retries):
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=15)
+            response = requests.get(url, params=params, headers=headers, timeout=20)
             if response.status_code == 200:
                 data = response.json()
-                logger.info(f"API'den {len(data)} coin alındı")
-                if data:
-                    # İlk 3 coin sembolünü logla
-                    sample = [coin.get('symbol', '?') for coin in data[:3]]
-                    logger.info(f"Örnek coin sembolleri: {sample}")
-                else:
-                    logger.warning("API'den boş liste geldi")
+                logger.info(f"CoinGecko'dan {len(data)} coin alındı")
                 return data
             else:
-                logger.warning(f"API yanıt kodu {response.status_code}, deneme {attempt+1}/{retries}")
+                logger.warning(f"CoinGecko yanıt kodu {response.status_code}, deneme {attempt+1}/{retries}")
                 if response.status_code == 429:
-                    time.sleep(delay * 5)
+                    time.sleep(10)
                     continue
-        except requests.exceptions.Timeout:
-            logger.warning(f"Zaman aşımı, deneme {attempt+1}/{retries}")
         except Exception as e:
-            logger.warning(f"API istek hatası: {e}, deneme {attempt+1}/{retries}")
+            logger.warning(f"CoinGecko hatası: {e}, deneme {attempt+1}/{retries}")
         time.sleep(delay * (attempt + 1))
-    logger.error("CoinGecko API'den veri alınamadı")
+    return None
+
+# --- CoinCap API (alternatif) ---
+def get_coins_from_coincap(retries=2, delay=2):
+    url = "https://api.coincap.io/v2/assets"
+    params = {
+        "limit": 50,
+        "sort": "volumeUsd24Hr"
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=20)
+            if response.status_code == 200:
+                data = response.json().get("data", [])
+                converted = []
+                for c in data:
+                    try:
+                        price = float(c.get("priceUsd", 0))
+                        change_24h = float(c.get("changePercent24Hr", 0))
+                        volume = float(c.get("volumeUsd24Hr", 0))
+                        market_cap = float(c.get("marketCapUsd", 0))
+                        converted.append({
+                            "symbol": c.get("symbol", "").upper(),
+                            "name": c.get("name", ""),
+                            "current_price": price,
+                            "price_change_percentage_1h_in_currency": 0.0,  # CoinCap'te 1h yok
+                            "price_change_percentage_24h": change_24h,
+                            "market_cap": market_cap,
+                            "total_volume": volume
+                        })
+                    except Exception:
+                        continue
+                logger.info(f"CoinCap'ten {len(converted)} coin alındı")
+                return converted
+            else:
+                logger.warning(f"CoinCap yanıt kodu {response.status_code}, deneme {attempt+1}/{retries}")
+        except Exception as e:
+            logger.warning(f"CoinCap hatası: {e}, deneme {attempt+1}/{retries}")
+        time.sleep(delay * (attempt + 1))
+    return None
+
+# --- Ana veri çekme fonksiyonu (önce CoinGecko, olmazsa CoinCap) ---
+def get_coins_with_volume():
+    coins = get_coins_from_coingecko()
+    if coins is not None:
+        return coins
+    logger.warning("CoinGecko başarısız, CoinCap deneniyor...")
+    coins = get_coins_from_coincap()
+    if coins is not None:
+        return coins
+    logger.error("Tüm API'ler başarısız, veri alınamadı.")
     return []
 
-# --- Analiz (daha sağlam) ---
+# --- Analiz ---
 def analyze_volatility(coin):
     try:
         symbol = coin.get("symbol", "").upper()
         price = coin.get("current_price", 0)
-        # 1h değişim: bazen None gelebilir, default 0
         change_1h = coin.get("price_change_percentage_1h_in_currency")
         if change_1h is None:
             change_1h = 0.0
         change_24h = coin.get("price_change_percentage_24h")
         if change_24h is None:
             change_24h = 0.0
-        
         market_cap = coin.get("market_cap") or 0
         total_volume = coin.get("total_volume") or 0
         volume_ratio = (total_volume / market_cap * 100) if market_cap > 0 else 0
         
-        # Skor hesaplama
         score = 50
         confidence = 40
         abs_1h = abs(change_1h)
         if abs_1h > 3:
-            score += 25; confidence += 25
+            score += 25
+            confidence += 25
         elif abs_1h > 1.5:
-            score += 15; confidence += 15
+            score += 15
+            confidence += 15
         elif abs_1h > 0.5:
-            score += 8; confidence += 8
+            score += 8
+            confidence += 8
         if change_24h > 5:
-            score += 12; confidence += 10
+            score += 12
+            confidence += 10
         elif change_24h < -5:
             score -= 12
         if volume_ratio > 50:
-            score += 15; confidence += 15
+            score += 15
+            confidence += 15
         elif volume_ratio > 30:
-            score += 10; confidence += 10
+            score += 10
+            confidence += 10
         elif volume_ratio > 20:
-            score += 5; confidence += 5
+            score += 5
+            confidence += 5
         score = max(0, min(100, score))
         confidence = max(0, min(100, confidence))
         
@@ -208,9 +257,8 @@ def run_analysis():
         
         if not coins:
             with LOCK:
-                bot_data["status"] = "❌ Veri alınamadı - API'den boş cevap"
+                bot_data["status"] = "❌ Veri alınamadı - API'ler çalışmıyor"
                 bot_data["analyzing"] = False
-            logger.error("Coin listesi boş, analiz iptal")
             return
         
         all_analyses = []
@@ -279,7 +327,7 @@ def auto_bot_loop():
 bot_thread = threading.Thread(target=auto_bot_loop, daemon=True)
 bot_thread.start()
 
-# --- HTML şablonu --- (öncekiyle aynı, değişmedi)
+# --- HTML şablonu ---
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="tr">
 <head>
