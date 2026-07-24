@@ -19,24 +19,8 @@ app = Flask(__name__)
 DB_FILE = "crypto_recommendations.db"
 LOCK = threading.Lock()
 
-# --- Türkiye saati (UTC+3) - ZoneInfo yoksa manuel offset ---
-try:
-    from zoneinfo import ZoneInfo
-    TZ_TR = ZoneInfo("Europe/Istanbul")
-except Exception:
-    # ZoneInfo yoksa veya timezone verisi yoksa UTC+3 kullan
-    class SimpleTZ:
-        def __init__(self, offset_hours=3):
-            self.offset = timedelta(hours=offset_hours)
-        def __repr__(self):
-            return f"UTC+{self.offset.total_seconds()//3600:.0f}"
-    TZ_TR = SimpleTZ(3)
-    # datetime.now(TZ_TR) çalışmaz, bu yüzden bir fonksiyon tanımlayalım
-    def now_tr():
-        return datetime.utcnow() + timedelta(hours=3)
-else:
-    def now_tr():
-        return datetime.now(TZ_TR)
+# Türkiye saati için UTC+3
+TZ_TR = timezone(timedelta(hours=3))
 
 # --- Veritabanı ---
 def init_db():
@@ -239,7 +223,7 @@ def run_analysis():
                     "change_1h": f"{analysis['change_1h']:+.2f}%",
                     "change_24h": f"{analysis['change_24h']:+.2f}%",
                     "volume": f"{analysis['volume_ratio']:.1f}%",
-                    "timestamp": now_tr().strftime("%H:%M:%S")
+                    "timestamp": datetime.now(TZ_TR).strftime("%H:%M:%S")
                 })
                 if is_buy:
                     buy_count += 1
@@ -254,7 +238,7 @@ def run_analysis():
         
         with LOCK:
             bot_data["recommendations"] = recommendations
-            bot_data["last_update"] = now_tr().strftime("%H:%M:%S")
+            bot_data["last_update"] = datetime.now(TZ_TR).strftime("%H:%M:%S")
             bot_data["total_analyzed"] = len(coins)
             bot_data["buy_count"] = buy_count
             bot_data["sell_count"] = sell_count
@@ -281,7 +265,7 @@ def auto_bot_loop():
 bot_thread = threading.Thread(target=auto_bot_loop, daemon=True)
 bot_thread.start()
 
-# --- HTML şablonu ---
+# --- HTML şablonu (aynı) ---
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="tr">
 <head>
