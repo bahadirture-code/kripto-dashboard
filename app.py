@@ -3,8 +3,7 @@ import requests
 import threading
 import time
 import logging
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 import sqlite3
 import os
 
@@ -19,7 +18,13 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 DB_FILE = "crypto_recommendations.db"
 LOCK = threading.Lock()
-TZ_TR = ZoneInfo("Europe/Istanbul")
+
+# Türkiye saati için UTC+3
+TURKEY_OFFSET = timedelta(hours=3)
+
+def get_turkey_time():
+    """Türkiye saati (UTC+3) döndür"""
+    return datetime.utcnow() + TURKEY_OFFSET
 
 # --- Veritabanı ---
 def init_db():
@@ -109,7 +114,7 @@ def get_coins_with_volume(retries=3, delay=3):
             else:
                 logger.warning(f"API yanıt kodu {response.status_code}, deneme {attempt+1}/{retries}")
                 if response.status_code == 429:  # Rate limit
-                    time.sleep(delay * 5)  # daha uzun bekle
+                    time.sleep(delay * 5)
                     continue
         except requests.exceptions.Timeout:
             logger.warning(f"Zaman aşımı, deneme {attempt+1}/{retries}")
@@ -119,7 +124,7 @@ def get_coins_with_volume(retries=3, delay=3):
     logger.error("CoinGecko API'den veri alınamadı - internet bağlantınızı kontrol edin")
     return []
 
-# --- Analiz (değişmedi) ---
+# --- Analiz ---
 def analyze_volatility(coin):
     try:
         symbol = coin.get("symbol", "").upper()
@@ -134,21 +139,28 @@ def analyze_volatility(coin):
         confidence = 40
         abs_1h = abs(change_1h)
         if abs_1h > 3:
-            score += 25; confidence += 25
+            score += 25
+            confidence += 25
         elif abs_1h > 1.5:
-            score += 15; confidence += 15
+            score += 15
+            confidence += 15
         elif abs_1h > 0.5:
-            score += 8; confidence += 8
+            score += 8
+            confidence += 8
         if change_24h > 5:
-            score += 12; confidence += 10
+            score += 12
+            confidence += 10
         elif change_24h < -5:
             score -= 12
         if volume_ratio > 50:
-            score += 15; confidence += 15
+            score += 15
+            confidence += 15
         elif volume_ratio > 30:
-            score += 10; confidence += 10
+            score += 10
+            confidence += 10
         elif volume_ratio > 20:
-            score += 5; confidence += 5
+            score += 5
+            confidence += 5
         score = max(0, min(100, score))
         confidence = max(0, min(100, confidence))
         
@@ -222,7 +234,7 @@ def run_analysis():
                     "change_1h": f"{analysis['change_1h']:+.2f}%",
                     "change_24h": f"{analysis['change_24h']:+.2f}%",
                     "volume": f"{analysis['volume_ratio']:.1f}%",
-                    "timestamp": datetime.now(TZ_TR).strftime("%H:%M:%S")
+                    "timestamp": get_turkey_time().strftime("%H:%M:%S")
                 })
                 if is_buy:
                     buy_count += 1
@@ -237,7 +249,7 @@ def run_analysis():
         
         with LOCK:
             bot_data["recommendations"] = recommendations
-            bot_data["last_update"] = datetime.now(TZ_TR).strftime("%H:%M:%S")
+            bot_data["last_update"] = get_turkey_time().strftime("%H:%M:%S")
             bot_data["total_analyzed"] = len(coins)
             bot_data["buy_count"] = buy_count
             bot_data["sell_count"] = sell_count
@@ -264,7 +276,7 @@ def auto_bot_loop():
 bot_thread = threading.Thread(target=auto_bot_loop, daemon=True)
 bot_thread.start()
 
-# --- HTML şablonu (öncekiyle aynı) ---
+# --- HTML şablonu ---
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="tr">
 <head>
