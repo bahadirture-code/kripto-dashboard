@@ -3,12 +3,12 @@ import requests
 import threading
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import sqlite3
-from queue import Queue
 import os
 
-# --- Loglama ayarları ---
+# --- Loglama ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 DB_FILE = "crypto_recommendations.db"
-LOCK = threading.Lock()  # bot_data ve DB erişimi için
+LOCK = threading.Lock()
+
+TZ_TR = ZoneInfo("Europe/Istanbul")  # Türkiye saati
 
 # --- Veritabanı ---
 def init_db():
@@ -36,25 +38,23 @@ def init_db():
         change_24h REAL,
         volume_change REAL
     )''')
-    # Eski kayıtları temizlemek için indeks (isteğe bağlı)
     c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON recommendations(timestamp)')
     conn.commit()
     conn.close()
     logger.info("Veritabanı hazır")
 
 def save_recommendations_bulk(recommendations):
-    """Toplu kayıt - performans için"""
     if not recommendations:
         return
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        now = datetime.now()
+        now_utc = datetime.utcnow()  # UTC kaydet
         data = []
         for r in recommendations:
             data.append((
                 r["symbol"], r["price"], r["signal"],
-                r["score"], r["confidence"], now,
+                r["score"], r["confidence"], now_utc,
                 r["change_1h"], r["change_24h"], r["volume_ratio"]
             ))
         c.executemany('''INSERT INTO recommendations 
@@ -67,7 +67,6 @@ def save_recommendations_bulk(recommendations):
         logger.error(f"DB hatası: {e}")
 
 def clean_old_records(keep_days=7):
-    """7 günden eski kayıtları sil"""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -91,9 +90,8 @@ bot_data = {
     "analyzing": False
 }
 
-# --- CoinGecko API (retry mekanizmalı) ---
+# --- CoinGecko API (retry) ---
 def get_coins_with_volume(retries=3, delay=2):
-    """CoinGecko'dan yüksek hacimli coinleri al - hata durumunda yeniden dene"""
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
@@ -111,13 +109,12 @@ def get_coins_with_volume(retries=3, delay=2):
                 logger.warning(f"API yanıt kodu {response.status_code}, deneme {attempt+1}/{retries}")
         except Exception as e:
             logger.warning(f"API istek hatası: {e}, deneme {attempt+1}/{retries}")
-        time.sleep(delay * (attempt + 1))  # üstel geri çekilme
+        time.sleep(delay * (attempt + 1))
     logger.error("CoinGecko API'den veri alınamadı")
     return []
 
-# --- Analiz fonksiyonu ---
+# --- Analiz ---
 def analyze_volatility(coin):
-    """Hacim + oynaklık analizi"""
     try:
         symbol = coin.get("symbol", "").upper()
         price = coin.get("current_price", 0)
@@ -128,7 +125,6 @@ def analyze_volatility(coin):
         total_volume = coin.get("total_volume") or 0
         volume_ratio = (total_volume / market_cap * 100) if market_cap > 0 else 0
         
-        # Skor hesaplama
         score = 50
         confidence = 40
         abs_1h = abs(change_1h)
@@ -162,7 +158,6 @@ def analyze_volatility(coin):
         score = max(0, min(100, score))
         confidence = max(0, min(100, confidence))
         
-        # Sinyal belirleme
         if score >= 80 and abs_1h > 2.5:
             signal = "🟢🔥 HIZLI ALIŞ"
         elif score >= 70:
@@ -191,9 +186,7 @@ def analyze_volatility(coin):
         return None
 
 def run_analysis():
-    """Ana analiz işlemi - thread güvenli"""
     global bot_data
-    
     with LOCK:
         if bot_data["analyzing"]:
             logger.info("Analiz zaten çalışıyor, atlanıyor")
@@ -222,12 +215,13 @@ def run_analysis():
                 continue
             all_analyses.append(analysis)
             
-            # Sadece ALIŞ/SATIŞ sinyallerini listeye al
             if "ALIŞ" in analysis["signal"] or "SATIŞ" in analysis["signal"]:
                 is_buy = "ALIŞ" in analysis["signal"]
+                # Coin ismini büyük harfe çevir
+                name_upper = coin.get("name", "").upper()
                 recommendations.append({
                     "symbol": analysis["symbol"],
-                    "name": coin.get("name", ""),
+                    "name": name_upper,
                     "price": f"${analysis['price']:.4f}" if analysis['price'] < 1 else f"${analysis['price']:.2f}",
                     "signal": analysis["signal"],
                     "score": analysis["score"],
@@ -235,27 +229,23 @@ def run_analysis():
                     "change_1h": f"{analysis['change_1h']:+.2f}%",
                     "change_24h": f"{analysis['change_24h']:+.2f}%",
                     "volume": f"{analysis['volume_ratio']:.1f}%",
-                    "timestamp": datetime.now().strftime("%H:%M:%S")
+                    "timestamp": datetime.now(TZ_TR).strftime("%H:%M:%S")  # Türkiye saati
                 })
                 if is_buy:
                     buy_count += 1
                 else:
                     sell_count += 1
             
-            # Log (kısaca)
             logger.debug(f"{analysis['symbol']}: {analysis['signal']} (Skor:{analysis['score']}, Vol:{analysis['volume_ratio']:.1f}%)")
         
-        # Veritabanına toplu kaydet
         save_recommendations_bulk(all_analyses)
-        # Eski kayıtları temizle (her analizde değil, günde bir kez yapılabilir ama basit olsun)
         clean_old_records(keep_days=7)
         
-        # Skora göre sırala
         recommendations.sort(key=lambda x: x["score"], reverse=True)
         
         with LOCK:
             bot_data["recommendations"] = recommendations
-            bot_data["last_update"] = datetime.now().strftime("%H:%M:%S")
+            bot_data["last_update"] = datetime.now(TZ_TR).strftime("%H:%M:%S")
             bot_data["total_analyzed"] = len(coins)
             bot_data["buy_count"] = buy_count
             bot_data["sell_count"] = sell_count
@@ -274,17 +264,15 @@ def run_analysis():
 def auto_bot_loop():
     init_db()
     logger.info("🔄 Otomatik bot döngüsü başladı")
-    # İlk çalıştırmayı hemen yap
     run_analysis()
     while True:
-        time.sleep(300)  # 5 dakika
+        time.sleep(300)
         run_analysis()
 
-# Thread'i başlat
 bot_thread = threading.Thread(target=auto_bot_loop, daemon=True)
 bot_thread.start()
 
-# --- HTML Şablonu (geliştirilmiş) ---
+# --- HTML Şablonu (güncellendi) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="tr">
@@ -520,7 +508,6 @@ HTML_TEMPLATE = """
             fetch('/api/analyze', { method: 'POST' })
                 .then(() => {
                     status.textContent = "✅ Analiz başladı, sonuçlar gelecek...";
-                    // 2 saniye sonra güncellemeye başla (analiz bitince)
                     setTimeout(() => {
                         update();
                         status.textContent = "";
@@ -536,7 +523,6 @@ HTML_TEMPLATE = """
             fetch('/api/signals')
                 .then(r => r.json())
                 .then(data => {
-                    // Durum bilgisi
                     document.getElementById('analyzed').textContent = data.total_analyzed;
                     document.getElementById('buyCount').textContent = data.buy_count;
                     document.getElementById('sellCount').textContent = data.sell_count;
@@ -551,7 +537,6 @@ HTML_TEMPLATE = """
                         statusEl.classList.add('error');
                     }
                     
-                    // Buton durumu
                     const btn = document.getElementById('analyzeBtn');
                     if (data.analyzing) {
                         btn.disabled = true;
@@ -565,7 +550,6 @@ HTML_TEMPLATE = """
                         }
                     }
 
-                    // Sinyalleri göster
                     const container = document.getElementById('signals');
                     
                     if (!data.recommendations || data.recommendations.length === 0) {
@@ -610,9 +594,7 @@ HTML_TEMPLATE = """
                 .catch(e => console.log('Güncelleme hatası:', e));
         }
 
-        // Her 5 saniyede bir güncelle (daha sık)
         setInterval(update, 5000);
-        // İlk yükleme
         update();
     </script>
 </body>
@@ -631,7 +613,6 @@ def api_signals():
 
 @app.route("/api/analyze", methods=["POST"])
 def api_analyze():
-    # Yeni bir thread'de çalıştır (run_analysis zaten çakışma kontrolü yapıyor)
     threading.Thread(target=run_analysis, daemon=True).start()
     return jsonify({"status": "ok"})
 
