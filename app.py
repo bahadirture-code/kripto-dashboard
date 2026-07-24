@@ -87,8 +87,47 @@ bot_data = {
     "analyzing": False
 }
 
-# --- CoinGecko API ---
-def get_coins_from_coingecko(retries=2, delay=2):
+# --- API'ler (önce CoinCap, başarısız olursa CoinGecko) ---
+def get_coins_from_coincap():
+    """CoinCap API'den hacim sıralı ilk 50 coini al"""
+    url = "https://api.coincap.io/v2/assets"
+    params = {"limit": 50, "sort": "volumeUsd24Hr"}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            converted = []
+            for c in data:
+                try:
+                    symbol = c.get("symbol", "").upper()
+                    name = c.get("name", "")
+                    price = float(c.get("priceUsd", 0))
+                    change_24h = float(c.get("changePercent24Hr", 0))
+                    volume = float(c.get("volumeUsd24Hr", 0))
+                    market_cap = float(c.get("marketCapUsd", 0))
+                    # 1h değişim yok, 0 varsayalım
+                    converted.append({
+                        "symbol": symbol,
+                        "name": name,
+                        "current_price": price,
+                        "price_change_percentage_1h_in_currency": 0.0,
+                        "price_change_percentage_24h": change_24h,
+                        "market_cap": market_cap,
+                        "total_volume": volume
+                    })
+                except:
+                    continue
+            logger.info(f"CoinCap'ten {len(converted)} coin alındı")
+            return converted
+        else:
+            logger.warning(f"CoinCap yanıt kodu: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"CoinCap hatası: {e}")
+    return None
+
+def get_coins_from_coingecko():
+    """CoinGecko API (alternatif)"""
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
@@ -97,91 +136,34 @@ def get_coins_from_coingecko(retries=2, delay=2):
         "price_change_percentage": "1h,24h",
         "sparkline": False
     }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    for attempt in range(retries):
-        try:
-            response = requests.get(url, params=params, headers=headers, timeout=20)
-            if response.status_code == 200:
-                data = response.json()
-                logger.info(f"CoinGecko'dan {len(data)} coin alındı")
-                return data
-            else:
-                logger.warning(f"CoinGecko yanıt kodu {response.status_code}, deneme {attempt+1}/{retries}")
-                if response.status_code == 429:
-                    time.sleep(10)
-                    continue
-        except Exception as e:
-            logger.warning(f"CoinGecko hatası: {e}, deneme {attempt+1}/{retries}")
-        time.sleep(delay * (attempt + 1))
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            logger.info(f"CoinGecko'dan {len(data)} coin alındı")
+            return data
+        else:
+            logger.warning(f"CoinGecko yanıt kodu: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"CoinGecko hatası: {e}")
     return None
 
-# --- CoinCap API (alternatif) ---
-def get_coins_from_coincap(retries=2, delay=2):
-    url = "https://api.coincap.io/v2/assets"
-    params = {
-        "limit": 50,
-        "sort": "volumeUsd24Hr"
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    for attempt in range(retries):
-        try:
-            response = requests.get(url, params=params, headers=headers, timeout=20)
-            if response.status_code == 200:
-                data = response.json().get("data", [])
-                converted = []
-                for c in data:
-                    try:
-                        price = float(c.get("priceUsd", 0))
-                        change_24h = float(c.get("changePercent24Hr", 0))
-                        volume = float(c.get("volumeUsd24Hr", 0))
-                        market_cap = float(c.get("marketCapUsd", 0))
-                        converted.append({
-                            "symbol": c.get("symbol", "").upper(),
-                            "name": c.get("name", ""),
-                            "current_price": price,
-                            "price_change_percentage_1h_in_currency": 0.0,  # CoinCap'te 1h yok
-                            "price_change_percentage_24h": change_24h,
-                            "market_cap": market_cap,
-                            "total_volume": volume
-                        })
-                    except Exception:
-                        continue
-                logger.info(f"CoinCap'ten {len(converted)} coin alındı")
-                return converted
-            else:
-                logger.warning(f"CoinCap yanıt kodu {response.status_code}, deneme {attempt+1}/{retries}")
-        except Exception as e:
-            logger.warning(f"CoinCap hatası: {e}, deneme {attempt+1}/{retries}")
-        time.sleep(delay * (attempt + 1))
-    return None
-
-# --- Ana veri çekme fonksiyonu (önce CoinGecko, olmazsa CoinCap) ---
 def get_coins_with_volume():
-    coins = get_coins_from_coingecko()
-    if coins is not None:
-        return coins
-    logger.warning("CoinGecko başarısız, CoinCap deneniyor...")
+    """Önce CoinCap dene, olmazsa CoinGecko"""
     coins = get_coins_from_coincap()
-    if coins is not None:
+    if coins:
         return coins
-    logger.error("Tüm API'ler başarısız, veri alınamadı.")
-    return []
+    logger.info("CoinCap başarısız, CoinGecko deneniyor...")
+    return get_coins_from_coingecko() or []
 
-# --- Analiz ---
+# --- Analiz (aynı) ---
 def analyze_volatility(coin):
     try:
         symbol = coin.get("symbol", "").upper()
         price = coin.get("current_price", 0)
-        change_1h = coin.get("price_change_percentage_1h_in_currency")
-        if change_1h is None:
-            change_1h = 0.0
-        change_24h = coin.get("price_change_percentage_24h")
-        if change_24h is None:
-            change_24h = 0.0
+        change_1h = coin.get("price_change_percentage_1h_in_currency") or 0
+        change_24h = coin.get("price_change_percentage_24h") or 0
         market_cap = coin.get("market_cap") or 0
         total_volume = coin.get("total_volume") or 0
         volume_ratio = (total_volume / market_cap * 100) if market_cap > 0 else 0
@@ -190,28 +172,21 @@ def analyze_volatility(coin):
         confidence = 40
         abs_1h = abs(change_1h)
         if abs_1h > 3:
-            score += 25
-            confidence += 25
+            score += 25; confidence += 25
         elif abs_1h > 1.5:
-            score += 15
-            confidence += 15
+            score += 15; confidence += 15
         elif abs_1h > 0.5:
-            score += 8
-            confidence += 8
+            score += 8; confidence += 8
         if change_24h > 5:
-            score += 12
-            confidence += 10
+            score += 12; confidence += 10
         elif change_24h < -5:
             score -= 12
         if volume_ratio > 50:
-            score += 15
-            confidence += 15
+            score += 15; confidence += 15
         elif volume_ratio > 30:
-            score += 10
-            confidence += 10
+            score += 10; confidence += 10
         elif volume_ratio > 20:
-            score += 5
-            confidence += 5
+            score += 5; confidence += 5
         score = max(0, min(100, score))
         confidence = max(0, min(100, confidence))
         
@@ -239,7 +214,7 @@ def analyze_volatility(coin):
             "volume_ratio": volume_ratio
         }
     except Exception as e:
-        logger.error(f"Analiz hatası ({coin.get('symbol', '?')}): {e}", exc_info=True)
+        logger.error(f"Analiz hatası ({coin.get('symbol', '?')}): {e}")
         return None
 
 def run_analysis():
@@ -252,12 +227,12 @@ def run_analysis():
         bot_data["status"] = "Analiz yapılıyor..."
     
     try:
-        logger.info("Analiz başlatılıyor...")
+        logger.info("Manuel analiz başlatıldı...")
         coins = get_coins_with_volume()
         
         if not coins:
             with LOCK:
-                bot_data["status"] = "❌ Veri alınamadı - API'ler çalışmıyor"
+                bot_data["status"] = "❌ Veri alınamadı - API'lerden cevap yok"
                 bot_data["analyzing"] = False
             return
         
@@ -291,8 +266,6 @@ def run_analysis():
                     buy_count += 1
                 else:
                     sell_count += 1
-            
-            logger.debug(f"{analysis['symbol']}: {analysis['signal']} (Skor:{analysis['score']}, Vol:{analysis['volume_ratio']:.1f}%)")
         
         save_recommendations_bulk(all_analyses)
         clean_old_records(keep_days=7)
@@ -307,27 +280,30 @@ def run_analysis():
             bot_data["status"] = f"✓ {len(coins)} coin | {len(recommendations)} volatil"
             bot_data["analyzing"] = False
         
-        logger.info(f"Analiz tamamlandı - ALIŞ:{buy_count}, SATIŞ:{sell_count}, Toplam sinyal:{len(recommendations)}")
+        logger.info(f"Analiz tamamlandı - ALIŞ:{buy_count}, SATIŞ:{sell_count}")
         
     except Exception as e:
         logger.error(f"Analiz hatası: {e}", exc_info=True)
         with LOCK:
-            bot_data["status"] = f"❌ {str(e)[:50]}"
+            bot_data["status"] = f"❌ Hata: {str(e)[:50]}"
             bot_data["analyzing"] = False
 
-# --- Otomatik döngü ---
-def auto_bot_loop():
-    init_db()
-    logger.info("🔄 Otomatik bot döngüsü başladı")
-    run_analysis()
-    while True:
-        time.sleep(300)
-        run_analysis()
+# --- Flask Rotaları ---
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
-bot_thread = threading.Thread(target=auto_bot_loop, daemon=True)
-bot_thread.start()
+@app.route("/api/signals")
+def api_signals():
+    with LOCK:
+        return jsonify(bot_data)
 
-# --- HTML şablonu ---
+@app.route("/api/analyze", methods=["POST"])
+def api_analyze():
+    threading.Thread(target=run_analysis, daemon=True).start()
+    return jsonify({"status": "ok"})
+
+# --- HTML (aynı) ---
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="tr">
 <head>
@@ -544,7 +520,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
             <h3 style="margin-top: 20px;">📊 Volatil Coinler</h3>
             <div id="signals">
-                <div class="empty-state">Analiz butonuna basın veya otomatik çalışmasını bekleyin...</div>
+                <div class="empty-state">Analiz butonuna basarak taramayı başlatın...</div>
             </div>
         </div>
     </div>
@@ -638,20 +614,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>
 """
-
-@app.route("/")
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route("/api/signals")
-def api_signals():
-    with LOCK:
-        return jsonify(bot_data)
-
-@app.route("/api/analyze", methods=["POST"])
-def api_analyze():
-    threading.Thread(target=run_analysis, daemon=True).start()
-    return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
