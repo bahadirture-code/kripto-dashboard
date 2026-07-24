@@ -1,18 +1,15 @@
 from flask import Flask, render_template_string, jsonify, request
+import requests
 import threading
 import time
 import logging
 from datetime import datetime, timedelta, timezone
 import sqlite3
 import os
-import json
-import urllib.request
-import urllib.error
-import ssl
 
 # --- Loglama ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Detaylı log için DEBUG
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -22,6 +19,26 @@ app = Flask(__name__)
 DB_FILE = "crypto_recommendations.db"
 LOCK = threading.Lock()
 TZ_TR = timezone(timedelta(hours=3))
+
+# --- Proxy ayarlarını environment'dan oku ---
+HTTP_PROXY = os.environ.get("HTTP_PROXY", "")
+HTTPS_PROXY = os.environ.get("HTTPS_PROXY", "")
+if HTTP_PROXY or HTTPS_PROXY:
+    proxies = {
+        "http": HTTP_PROXY,
+        "https": HTTPS_PROXY,
+    }
+    logger.info(f"Proxy kullanılıyor: {proxies}")
+else:
+    proxies = None
+
+# --- Session oluştur (bağlantı havuzu) ---
+session = requests.Session()
+if proxies:
+    session.proxies.update(proxies)
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+})
 
 # --- Veritabanı ---
 def init_db():
@@ -90,116 +107,119 @@ bot_data = {
     "analyzing": False
 }
 
-# --- API'ler (urllib ile) ---
-def url_get_json(url, timeout=10):
-    """urllib ile GET isteği at, JSON döndür"""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+# --- API'ler (sırayla dene) ---
+def fetch_coincap():
+    """CoinCap API - en hızlı, genelde açık"""
+    url = "https://api.coincap.io/v2/assets"
+    params = {"limit": 50, "sort": "volumeUsd24Hr"}
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            data = resp.read().decode('utf-8')
-            return json.loads(data)
+        resp = session.get(url, params=params, timeout=20)
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            converted = []
+            for c in data:
+                try:
+                    symbol = c.get("symbol", "").upper()
+                    name = c.get("name", "")
+                    price = float(c.get("priceUsd", 0))
+                    change_24h = float(c.get("changePercent24Hr", 0))
+                    volume = float(c.get("volumeUsd24Hr", 0))
+                    market_cap = float(c.get("marketCapUsd", 0))
+                    converted.append({
+                        "symbol": symbol,
+                        "name": name,
+                        "current_price": price,
+                        "price_change_percentage_1h_in_currency": 0.0,
+                        "price_change_percentage_24h": change_24h,
+                        "market_cap": market_cap,
+                        "total_volume": volume
+                    })
+                except Exception as e:
+                    logger.debug(f"CoinCap dönüşüm hatası: {e}")
+                    continue
+            logger.info(f"CoinCap'ten {len(converted)} coin alındı")
+            return converted
+        else:
+            logger.warning(f"CoinCap yanıt kodu: {resp.status_code}")
     except Exception as e:
-        logger.warning(f"URL isteği başarısız: {url} - {e}")
-        return None
+        logger.warning(f"CoinCap hatası: {e}")
+    return None
 
-def get_coins_from_binance():
-    """Binance API - 24h hacim sıralı ilk 50"""
+def fetch_coingecko():
+    """CoinGecko API"""
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "volume_desc",
+        "per_page": 50,
+        "price_change_percentage": "1h,24h",
+        "sparkline": False
+    }
+    try:
+        resp = session.get(url, params=params, timeout=20)
+        if resp.status_code == 200:
+            data = resp.json()
+            logger.info(f"CoinGecko'dan {len(data)} coin alındı")
+            return data
+        else:
+            logger.warning(f"CoinGecko yanıt kodu: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"CoinGecko hatası: {e}")
+    return None
+
+def fetch_binance():
+    """Binance API - 24h hacim sıralı ilk 50 coin (USDT pair)"""
     url = "https://api.binance.com/api/v3/ticker/24hr"
-    data = url_get_json(url, timeout=10)
-    if not data:
-        return None
-    # Hacme göre sırala (quoteVolume)
-    sorted_data = sorted(data, key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)[:50]
-    converted = []
-    for item in sorted_data:
-        try:
-            symbol = item.get('symbol', '').replace('USDT', '').upper()
-            if not symbol or 'USDT' not in item.get('symbol', ''):
-                continue
-            price = float(item.get('lastPrice', 0))
-            change_24h = float(item.get('priceChangePercent', 0))
-            volume = float(item.get('quoteVolume', 0))
-            # market_cap yok, hacim kullan
-            converted.append({
-                "symbol": symbol,
-                "name": symbol,
-                "current_price": price,
-                "price_change_percentage_1h_in_currency": 0.0,  # Binance'de 1h yok
-                "price_change_percentage_24h": change_24h,
-                "market_cap": volume * 2,  # kabaca market cap tahmini
-                "total_volume": volume
-            })
-        except:
-            continue
-    logger.info(f"Binance'ten {len(converted)} coin alındı")
-    return converted
-
-def get_coins_from_kucoin():
-    """Kucoin API"""
-    url = "https://api.kucoin.com/api/v1/market/allTickers"
-    data = url_get_json(url, timeout=10)
-    if not data or data.get('code') != '200000':
-        return None
-    tickers = data.get('data', {}).get('ticker', [])
-    # USDT çiftlerini filtrele, hacme göre sırala
-    usdt_tickers = [t for t in tickers if t.get('symbol', '').endswith('USDT')]
-    sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get('vol', 0)), reverse=True)[:50]
-    converted = []
-    for item in sorted_tickers:
-        try:
-            symbol = item.get('symbol', '').replace('USDT', '').upper()
-            price = float(item.get('last', 0))
-            change_24h = float(item.get('changeRate', 0)) * 100
-            volume = float(item.get('vol', 0)) * price  # hacim USD
-            converted.append({
-                "symbol": symbol,
-                "name": symbol,
-                "current_price": price,
-                "price_change_percentage_1h_in_currency": 0.0,
-                "price_change_percentage_24h": change_24h,
-                "market_cap": volume * 5,  # tahmini
-                "total_volume": volume
-            })
-        except:
-            continue
-    logger.info(f"Kucoin'den {len(converted)} coin alındı")
-    return converted
-
-def get_coins_from_coingecko():
-    """CoinGecko API (urllib ile)"""
-    url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=50&price_change_percentage=1h,24h&sparkline=false"
-    data = url_get_json(url, timeout=15)
-    if not data:
-        return None
-    logger.info(f"CoinGecko'dan {len(data)} coin alındı")
-    return data
-
-def get_coins_from_fallback():
-    """Son çare: manuel statik veri (uygulama boş kalmasın)"""
-    logger.warning("Fallback verisi kullanılıyor")
-    return [
-        {"symbol": "BTC", "name": "Bitcoin", "current_price": 60000, "price_change_percentage_1h_in_currency": 0.5, "price_change_percentage_24h": 2.1, "market_cap": 1e12, "total_volume": 5e10},
-        {"symbol": "ETH", "name": "Ethereum", "current_price": 3000, "price_change_percentage_1h_in_currency": 0.3, "price_change_percentage_24h": 1.5, "market_cap": 5e11, "total_volume": 2e10},
-        {"symbol": "BNB", "name": "BNB", "current_price": 500, "price_change_percentage_1h_in_currency": 0.1, "price_change_percentage_24h": 0.8, "market_cap": 1e11, "total_volume": 1e9},
-    ]
+    try:
+        resp = session.get(url, timeout=20)
+        if resp.status_code == 200:
+            data = resp.json()
+            # USDT ile biten ve hacmi yüksek olanları filtrele
+            usdt_pairs = [d for d in data if d['symbol'].endswith('USDT') and float(d['quoteVolume']) > 0]
+            # Hacme göre sırala (quoteVolume)
+            sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)[:50]
+            converted = []
+            for d in sorted_pairs:
+                symbol = d['symbol'].replace('USDT', '').upper()
+                price = float(d['lastPrice'])
+                change_24h = float(d['priceChangePercent'])
+                volume = float(d['quoteVolume'])
+                market_cap = volume * 10  # market cap yok, tahmini
+                converted.append({
+                    "symbol": symbol,
+                    "name": symbol,  # isim yok, sembolü kullan
+                    "current_price": price,
+                    "price_change_percentage_1h_in_currency": 0.0,  # 1h yok
+                    "price_change_percentage_24h": change_24h,
+                    "market_cap": market_cap,
+                    "total_volume": volume
+                })
+            logger.info(f"Binance'ten {len(converted)} coin alındı")
+            return converted
+        else:
+            logger.warning(f"Binance yanıt kodu: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Binance hatası: {e}")
+    return None
 
 def get_coins_with_volume():
-    """Sırayla dene: Binance -> Kucoin -> CoinGecko -> Fallback"""
-    coins = get_coins_from_binance()
+    """Sırayla dene: CoinCap -> CoinGecko -> Binance"""
+    logger.info("API'lerden veri alınmaya çalışılıyor...")
+    coins = fetch_coincap()
     if coins:
         return coins
-    coins = get_coins_from_kucoin()
+    logger.info("CoinCap başarısız, CoinGecko deneniyor...")
+    coins = fetch_coingecko()
     if coins:
         return coins
-    coins = get_coins_from_coingecko()
+    logger.info("CoinGecko başarısız, Binance deneniyor...")
+    coins = fetch_binance()
     if coins:
         return coins
-    return get_coins_from_fallback()
+    logger.error("Tüm API'ler başarısız oldu.")
+    return []
 
-# --- Analiz (aynı) ---
+# --- Analiz (değişmedi) ---
 def analyze_volatility(coin):
     try:
         symbol = coin.get("symbol", "").upper()
@@ -274,7 +294,7 @@ def run_analysis():
         
         if not coins:
             with LOCK:
-                bot_data["status"] = "❌ Veri alınamadı - tüm API'ler başarısız"
+                bot_data["status"] = "❌ Tüm API'ler başarısız - lütfen daha sonra tekrar deneyin"
                 bot_data["analyzing"] = False
             return
         
@@ -345,7 +365,7 @@ def api_analyze():
     threading.Thread(target=run_analysis, daemon=True).start()
     return jsonify({"status": "ok"})
 
-# --- HTML (aynı) ---
+# --- HTML (kısaltılmış, öncekiyle aynı) ---
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="tr">
 <head>
