@@ -9,7 +9,7 @@ import os
 
 # --- Loglama ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # DEBUG seviyesine alalım
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -18,8 +18,6 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 DB_FILE = "crypto_recommendations.db"
 LOCK = threading.Lock()
-
-# Türkiye saati için UTC+3
 TZ_TR = timezone(timedelta(hours=3))
 
 # --- Veritabanı ---
@@ -89,7 +87,7 @@ bot_data = {
     "analyzing": False
 }
 
-# --- CoinGecko API (geliştirilmiş) ---
+# --- CoinGecko API (geliştirilmiş loglama) ---
 def get_coins_with_volume(retries=3, delay=3):
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
@@ -106,10 +104,18 @@ def get_coins_with_volume(retries=3, delay=3):
         try:
             response = requests.get(url, params=params, headers=headers, timeout=15)
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                logger.info(f"API'den {len(data)} coin alındı")
+                if data:
+                    # İlk 3 coin sembolünü logla
+                    sample = [coin.get('symbol', '?') for coin in data[:3]]
+                    logger.info(f"Örnek coin sembolleri: {sample}")
+                else:
+                    logger.warning("API'den boş liste geldi")
+                return data
             else:
                 logger.warning(f"API yanıt kodu {response.status_code}, deneme {attempt+1}/{retries}")
-                if response.status_code == 429:  # Rate limit
+                if response.status_code == 429:
                     time.sleep(delay * 5)
                     continue
         except requests.exceptions.Timeout:
@@ -117,20 +123,27 @@ def get_coins_with_volume(retries=3, delay=3):
         except Exception as e:
             logger.warning(f"API istek hatası: {e}, deneme {attempt+1}/{retries}")
         time.sleep(delay * (attempt + 1))
-    logger.error("CoinGecko API'den veri alınamadı - internet bağlantınızı kontrol edin")
+    logger.error("CoinGecko API'den veri alınamadı")
     return []
 
-# --- Analiz ---
+# --- Analiz (daha sağlam) ---
 def analyze_volatility(coin):
     try:
         symbol = coin.get("symbol", "").upper()
         price = coin.get("current_price", 0)
-        change_1h = coin.get("price_change_percentage_1h_in_currency") or 0
-        change_24h = coin.get("price_change_percentage_24h") or 0
+        # 1h değişim: bazen None gelebilir, default 0
+        change_1h = coin.get("price_change_percentage_1h_in_currency")
+        if change_1h is None:
+            change_1h = 0.0
+        change_24h = coin.get("price_change_percentage_24h")
+        if change_24h is None:
+            change_24h = 0.0
+        
         market_cap = coin.get("market_cap") or 0
         total_volume = coin.get("total_volume") or 0
         volume_ratio = (total_volume / market_cap * 100) if market_cap > 0 else 0
         
+        # Skor hesaplama
         score = 50
         confidence = 40
         abs_1h = abs(change_1h)
@@ -177,7 +190,7 @@ def analyze_volatility(coin):
             "volume_ratio": volume_ratio
         }
     except Exception as e:
-        logger.error(f"Analiz hatası ({coin.get('symbol', '?')}): {e}")
+        logger.error(f"Analiz hatası ({coin.get('symbol', '?')}): {e}", exc_info=True)
         return None
 
 def run_analysis():
@@ -195,8 +208,9 @@ def run_analysis():
         
         if not coins:
             with LOCK:
-                bot_data["status"] = "❌ Veri alınamadı - lütfen internet bağlantınızı kontrol edin"
+                bot_data["status"] = "❌ Veri alınamadı - API'den boş cevap"
                 bot_data["analyzing"] = False
+            logger.error("Coin listesi boş, analiz iptal")
             return
         
         all_analyses = []
@@ -265,7 +279,7 @@ def auto_bot_loop():
 bot_thread = threading.Thread(target=auto_bot_loop, daemon=True)
 bot_thread.start()
 
-# --- HTML şablonu (aynı) ---
+# --- HTML şablonu --- (öncekiyle aynı, değişmedi)
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="tr">
 <head>
